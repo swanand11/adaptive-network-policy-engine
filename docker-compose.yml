@@ -1,7 +1,11 @@
 version: '3.8'
 
-services:
+networks:
+  app-network:
+    driver: bridge
 
+services:
+  # Zookeeper
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
@@ -9,7 +13,10 @@ services:
       ZOOKEEPER_CLIENT_PORT: 2181
     ports:
       - "2181:2181"
+    networks:
+      - app-network
 
+  # Kafka
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
@@ -21,18 +28,25 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    networks:
+      - app-network
+
+  # Redis
   redis:
     image: redis:7
     container_name: redis
     ports:
       - "6379:6379"
+    networks:
+      - app-network
 
+  # MongoDB
   mongo:
     image: mongo:7
     container_name: mongo
@@ -40,4 +54,65 @@ services:
       - "27017:27017"
     environment:
       - MONGO_URI=mongodb://mongo:27017/
+    networks:
+      - app-network
 
+  # Mock Services - AWS
+  aws-simulator:
+    build:
+      context: .
+      dockerfile: mocks/Dockerfile
+    container_name: aws-simulator
+    command: python -m mocks.aws_simulator
+    ports:
+      - "8001:8001"
+    environment:
+      SERVICE_PORT: "8001"
+    networks:
+      - app-network
+
+  # Mock Services - AKS
+  aks-simulator:
+    build:
+      context: .
+      dockerfile: mocks/Dockerfile
+    container_name: aks-simulator
+    command: python -m mocks.aks_simulator
+    ports:
+      - "8002:8002"
+    environment:
+      SERVICE_PORT: "8002"
+    networks:
+      - app-network
+
+  # Mock Services - DigitalOcean
+  digitalocean-simulator:
+    build:
+      context: .
+      dockerfile: mocks/Dockerfile
+    container_name: digitalocean-simulator
+    command: python -m mocks.dodroplets_simulator
+    ports:
+      - "8003:8003"
+    environment:
+      SERVICE_PORT: "8003"
+    networks:
+      - app-network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - app-network
+    depends_on:
+      - aws-simulator
+      - aks-simulator
+      - digitalocean-simulator

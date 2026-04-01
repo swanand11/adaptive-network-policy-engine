@@ -1,0 +1,4 @@
+flask==2.3.0
+prometheus-client==0.17.0
+kafka-python==2.0.2
+python-dotenv==1.0.0

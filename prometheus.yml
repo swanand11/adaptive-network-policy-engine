@@ -1,0 +1,43 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "aws-service"
+    static_configs:
+      - targets: ["aws-simulator:8001"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: []
+        target_label: cloud
+        replacement: aws
+      - source_labels: []
+        target_label: service_id
+        replacement: service-api
+
+  - job_name: "aks-service"
+    static_configs:
+      - targets: ["aks-simulator:8002"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: []
+        target_label: cloud
+        replacement: aks
+      - source_labels: []
+        target_label: service_id
+        replacement: service-db
+
+  - job_name: "do-service"
+    static_configs:
+      - targets: ["digitalocean-simulator:8003"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: []
+        target_label: cloud
+        replacement: digitalocean
+      - source_labels: []
+        target_label: service_id
+        replacement: service-cache

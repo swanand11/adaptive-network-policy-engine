@@ -1,0 +1,34 @@
+Run this to verify everything works:
+# 1. Start all services
+docker-compose up -d
+
+# 2. Check individual services
+curl http://localhost:8001/metrics  # AWS metrics
+curl http://localhost:8002/metrics  # AKS metrics
+curl http://localhost:8003/metrics  # DO metrics
+
+# 3. Access Prometheus
+# Open http://localhost:9090
+# - Check "Targets" page - all 3 services should be UP
+# - Query examples:
+#   request_latency_seconds{cloud="aws"}
+#   cpu_usage_percent{cloud="aks"}
+#   error_rate_percent{cloud="digitalocean"}
+
+# 4. View metrics with labels
+# http://localhost:9090/graph
+# Query: {cloud="aws"}
+
+
+Expected Prometheus Metrics Output (at /metrics):
+# HELP request_count_total Total requests
+# TYPE request_count_total counter
+request_count_total{cloud="aws",service_id="service-api"} 42.0
+
+# HELP cpu_usage_percent CPU usage percentage
+# TYPE cpu_usage_percent gauge
+cpu_usage_percent{cloud="aws",service_id="service-api"} 38.5
+
+# HELP error_rate_percent Error rate percentage
+# TYPE error_rate_percent gauge
+error_rate_percent{cloud="aws",service_id="service-api"} 0.7

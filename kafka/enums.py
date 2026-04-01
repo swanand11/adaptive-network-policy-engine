@@ -41,7 +41,7 @@ class CloudProvider(str, Enum):
     """Cloud provider enumeration."""
     AWS = "aws"
     AZURE = "azure"
-    GCP = "gcp"
+    DIGITALOCEAN = "digitalocean"
 
 
 class PolicyStatus(str, Enum):
