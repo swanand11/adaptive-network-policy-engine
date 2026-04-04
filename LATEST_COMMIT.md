@@ -44,7 +44,7 @@ Environment variables (optional):
 
 ```bash
 docker-compose up --build
-docker-compose logs -f prometheus-adapter
+dockers logs -f prometheus-adapter
 ```
 
 ## Implementation Notes
