@@ -232,12 +232,12 @@ NEXT STEPS:
 =============================================================================
 """
 
-from kafka.producer_base import KafkaProducerTemplate
-from kafka.consumer_base import KafkaConsumerTemplate
-from kafka.topic_initializer import TopicInitializer, initialize_kafka_topics
-from kafka.config import KafkaConfig
-from kafka.enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
-from kafka.schemas import (
+from .producer_base import KafkaProducerTemplate
+from .consumer_base import KafkaConsumerTemplate
+from .topic_initializer import TopicInitializer, initialize_kafka_topics
+from .config import KafkaConfig
+from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
+from .schemas import (
     MetricsEvent,
     MetricsEventValue,
     AuditLogEvent,

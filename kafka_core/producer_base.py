@@ -75,8 +75,8 @@ from kafka import KafkaProducer
 from kafka.errors import KafkaError
 from pydantic import BaseModel
 
-from kafka.config import KafkaConfig
-from kafka.exceptions import KafkaProducerError
+from .config import KafkaConfig
+from .exceptions import KafkaProducerError
 
 
 logger = logging.getLogger(__name__)

@@ -86,8 +86,8 @@ from abc import ABC, abstractmethod
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
 
-from kafka.config import KafkaConfig
-from kafka.exceptions import KafkaConsumerError
+from .config import KafkaConfig
+from .exceptions import KafkaConsumerError
 
 
 logger = logging.getLogger(__name__)

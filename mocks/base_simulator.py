@@ -91,7 +91,9 @@ class BaseSimulator(ABC):
         @self.app.route("/metrics")
         def metrics():
             """Prometheus metrics endpoint."""
-            return generate_latest(self.registry)
+            return generate_latest(self.registry), 200, {
+    "Content-Type": "text/plain; version=0.0.4"
+}
 
         @self.app.route("/simulate", methods=["POST"])
         def simulate():

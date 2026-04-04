@@ -74,8 +74,8 @@ from typing import List, Dict, Optional
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError, KafkaError
 
-from kafka.config import KafkaConfig, TopicConfig
-from kafka.exceptions import TopicInitializationError
+from .config import KafkaConfig, TopicConfig
+from .exceptions import TopicInitializationError
 
 
 logger = logging.getLogger(__name__)

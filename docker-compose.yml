@@ -8,7 +8,7 @@ services:
   # Zookeeper
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
-    container_name: zookeeper
+    container_name: zookeeper_1
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     ports:
@@ -19,7 +19,7 @@ services:
   # Kafka
   kafka:
     image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
+    container_name: kafka_1
     depends_on:
       - zookeeper
     ports:
@@ -40,7 +40,7 @@ services:
   # Redis
   redis:
     image: redis:7
-    container_name: redis
+    container_name: redis_1
     ports:
       - "6379:6379"
     networks:
@@ -49,7 +49,7 @@ services:
   # MongoDB
   mongo:
     image: mongo:7
-    container_name: mongo
+    container_name: mongo_1
     ports:
       - "27017:27017"
     environment:
@@ -116,3 +116,48 @@ services:
       - aws-simulator
       - aks-simulator
       - digitalocean-simulator
+
+  # Prometheus Metrics Adapter - Bridges Prometheus to Kafka
+  prometheus-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: prometheus-adapter
+    environment:
+      # Polling configuration (5-second interval)
+      PROMETHEUS_POLL_INTERVAL: "5"
+      PROMETHEUS_TIMEOUT: "3"
+      PROMETHEUS_MAX_RETRIES: "2"
+      
+      # Prometheus endpoints (use container DNS names from your mock services)
+      PROMETHEUS_AWS_URL: "http://aws-simulator:8001/metrics"
+      PROMETHEUS_AKS_URL: "http://aks-simulator:8002/metrics"
+      PROMETHEUS_DO_URL: "http://digitalocean-simulator:8003/metrics"
+      
+      # Kafka configuration (internal Docker network)
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      
+      # Logging
+      LOG_LEVEL: "INFO"
+      
+      # Python
+      PYTHONUNBUFFERED: "1"
+    
+    depends_on:
+      - kafka
+      - aws-simulator
+      - aks-simulator
+      - digitalocean-simulator
+      - prometheus
+    
+    networks:
+      - app-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; print('Health check OK')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

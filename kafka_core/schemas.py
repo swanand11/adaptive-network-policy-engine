@@ -57,7 +57,7 @@ DEPENDENCIES:
 from typing import Any, Dict, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
-from kafka.enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
+from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
 
 
 # ============================================================
