@@ -170,6 +170,7 @@ services:
     command: python service_agent_runner.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      SERVICE_ID: "service-cache-aws"
       LOG_LEVEL: "INFO"
       PYTHONUNBUFFERED: "1"
     depends_on:

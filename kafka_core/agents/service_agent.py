@@ -5,29 +5,40 @@ from uuid import uuid4
 
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
-from kafka_core.schemas import MetricsEvent, PolicyDecision, PolicyDecisionValue
-from kafka_core.enums import PolicyStatus, RiskLevel
+from kafka_core.schemas import (
+    MetricsEvent,
+    ServiceState,
+    ServiceStateValue,
+    ServiceStateBelief,
+    ServiceStateIntent,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class ServiceAgent(KafkaConsumerTemplate):
-    """Service Agent that consumes metrics events and produces policy decisions."""
+    """Service Agent consumes metrics.events and produces service.state events."""
 
     def __init__(
         self,
         service_id: str,
         alpha: float = 0.3,
         latency_threshold: float = 200.0,
+        error_threshold: float = 0.05,
+        cpu_threshold: float = 0.8,
+        window_size: int = 5,
         group_id: str = "service_agent",
     ):
         super().__init__(topics=["metrics.events"], group_id=group_id)
         self.service_id = service_id
         self.alpha = alpha
         self.latency_threshold = latency_threshold
+        self.error_threshold = error_threshold
+        self.cpu_threshold = cpu_threshold
         self.ewma_latency: Optional[float] = None
         self.latency_window: list[float] = []
-        self.window_size = 5
+        self.error_window: list[float] = []
+        self.window_size = window_size
         self.producer = KafkaProducerTemplate()
 
     def update_ewma(self, current_latency: float) -> float:
@@ -40,10 +51,15 @@ class ServiceAgent(KafkaConsumerTemplate):
             )
         return self.ewma_latency
 
-    def update_window(self, current_latency: float) -> None:
+    def update_window(self, current_latency: float, error_rate: Optional[float]) -> None:
         self.latency_window.append(current_latency)
         if len(self.latency_window) > self.window_size:
             self.latency_window.pop(0)
+
+        if error_rate is not None:
+            self.error_window.append(error_rate)
+            if len(self.error_window) > self.window_size:
+                self.error_window.pop(0)
 
     def compute_trend(self) -> float:
         if len(self.latency_window) < 2:
@@ -53,55 +69,102 @@ class ServiceAgent(KafkaConsumerTemplate):
     def compute_confidence(self) -> float:
         if len(self.latency_window) < 2:
             return 0.5
-        variance = max(self.latency_window) - min(self.latency_window)
-        if variance < 20:
-            return 0.9
-        if variance < 50:
-            return 0.75
-        return 0.6
 
-    def build_belief(self, current_latency: float) -> Dict[str, Any]:
+        latency_spread = max(self.latency_window) - min(self.latency_window)
+        error_spread = max(self.error_window) - min(self.error_window) if self.error_window else 0.0
+        score = 1.0 - min((latency_spread / 100.0), 0.5) - min((error_spread / 0.1), 0.3)
+        return round(max(min(score, 0.95), 0.5), 2)
+
+    def classify_status(
+        self,
+        latency: float,
+        error_rate: Optional[float],
+        cpu: Optional[float],
+    ) -> str:
+        overloaded_conditions = [latency > self.latency_threshold]
+        if error_rate is not None:
+            overloaded_conditions.append(error_rate >= self.error_threshold)
+        if cpu is not None:
+            overloaded_conditions.append(cpu >= self.cpu_threshold)
+
+        if any(overloaded_conditions):
+            return "overloaded"
+
+        stressed_conditions = [latency > self.latency_threshold * 0.8]
+        if error_rate is not None:
+            stressed_conditions.append(error_rate >= self.error_threshold * 0.6)
+        if cpu is not None:
+            stressed_conditions.append(cpu >= self.cpu_threshold * 0.75)
+
+        if any(stressed_conditions):
+            return "stressed"
+
+        return "healthy"
+
+    def estimate_current_load(
+        self,
+        latency: float,
+        error_rate: Optional[float],
+        cpu: Optional[float],
+    ) -> float:
+        penalty = 0.0
+        if latency > self.latency_threshold:
+            penalty += min((latency - self.latency_threshold) / (self.latency_threshold * 2), 0.5)
+        else:
+            penalty += max((latency - self.latency_threshold * 0.5) / self.latency_threshold, 0.0) * -0.1
+
+        if error_rate is not None:
+            penalty += min(error_rate * 2.0, 0.5)
+
+        if cpu is not None:
+            penalty += max((cpu - 0.5) * 0.4, 0.0)
+
+        current_load = 1.0 - penalty
+        return round(max(min(current_load, 0.95), 0.05), 2)
+
+    def derive_desired_load(self, current_load: float, status: str) -> float:
+        if status == "overloaded":
+            return round(max(current_load - 0.25, 0.0), 2)
+        if status == "stressed":
+            return round(max(current_load - 0.1, 0.0), 2)
+        return round(min(current_load + 0.05, 1.0), 2)
+
+    def build_belief(
+        self,
+        current_latency: float,
+        current_error: Optional[float],
+        current_cpu: Optional[float],
+    ) -> Dict[str, Any]:
         ewma = self.update_ewma(current_latency)
-        self.update_window(current_latency)
+        self.update_window(current_latency, current_error)
         trend_value = self.compute_trend()
         confidence = self.compute_confidence()
+        status = self.classify_status(current_latency, current_error, current_cpu)
 
         return {
-            "latency": round(ewma, 2),
+            "latency_ewma": round(ewma, 2),
             "trend": f"{'+ ' if trend_value >= 0 else ''}{round(trend_value, 2)}ms".replace('+ ', '+'),
-            "confidence": round(confidence, 2),
+            "confidence": confidence,
+            "status": status,
         }
 
-    def build_intent(self, belief: Dict[str, Any]) -> Dict[str, Any]:
-        latency = belief["latency"]
-        trend = belief["trend"]
+    def build_intent(
+        self,
+        belief: Dict[str, Any],
+        current_error: Optional[float],
+        current_cpu: Optional[float],
+    ) -> Dict[str, float]:
+        current_load = self.estimate_current_load(
+            latency=belief["latency_ewma"],
+            error_rate=current_error,
+            cpu=current_cpu,
+        )
+        desired_load = self.derive_desired_load(current_load, belief["status"])
 
-        if latency > self.latency_threshold:
-            return {"action": "shift_traffic_out", "magnitude": 0.1}
-        if trend.startswith("+") and trend != "+0.0ms":
-            return {"action": "watch_closely", "magnitude": 0.05}
-        return {"action": "hold", "magnitude": 0.0}
-
-    def classify_risk(self, belief: Dict[str, Any], intent: Dict[str, Any]) -> RiskLevel:
-        confidence = belief["confidence"]
-        magnitude = intent["magnitude"]
-
-        if intent["action"] == "hold":
-            return RiskLevel.LOW
-        if confidence >= 0.85 and magnitude <= 0.05:
-            return RiskLevel.LOW
-        if confidence >= 0.7 and magnitude <= 0.1:
-            return RiskLevel.MEDIUM
-        if magnitude > 0.1:
-            return RiskLevel.HIGH
-        return RiskLevel.MEDIUM
-
-    def format_decision_text(self, intent: Dict[str, Any], cloud: str) -> str:
-        if intent["action"] == "shift_traffic_out":
-            return f"shift {int(intent['magnitude'] * 100)}% traffic away from {cloud.upper()}"
-        if intent["action"] == "watch_closely":
-            return f"monitor {cloud.upper()} latency and keep current weights"
-        return "hold current traffic distribution"
+        return {
+            "current_load": current_load,
+            "desired_load": desired_load,
+        }
 
     def process_message(self, topic: str, message: Dict[str, Any]) -> bool:
         try:
@@ -109,11 +172,6 @@ class ServiceAgent(KafkaConsumerTemplate):
         except Exception as exc:
             logger.error(f"Invalid metrics event: {exc} | message={message}")
             return False
-
-        current_latency = self._extract_latency(event.value.metrics)
-        if current_latency is None:
-            logger.warning("Skipping metrics event without latency_ms")
-            return True
 
         if event.value.service != self.service_id:
             logger.debug(
@@ -123,50 +181,74 @@ class ServiceAgent(KafkaConsumerTemplate):
             )
             return True
 
-        belief = self.build_belief(current_latency)
-        intent = self.build_intent(belief)
-        risk = self.classify_risk(belief, intent)
-        decision_text = self.format_decision_text(intent, event.value.cloud.value)
+        metrics = event.value.metrics
+        current_latency = self._extract_metric(metrics, "latency_ms")
+        if current_latency is None:
+            logger.warning("Skipping metrics event without latency_ms")
+            return True
 
-        policy = PolicyDecision(
+        raw_error = self._extract_metric(metrics, "error_rate")
+        raw_cpu = self._extract_metric(metrics, "cpu_percent", "cpu")
+        current_error = self._normalize_percentage(raw_error)
+        current_cpu = self._normalize_percentage(raw_cpu)
+        current_throughput = self._extract_metric(metrics, "throughput", "requests_per_sec")
+        memory_percent = self._extract_metric(metrics, "memory_percent", "memory")
+
+        belief = self.build_belief(current_latency, current_error, current_cpu)
+        intent = self.build_intent(belief, current_error, current_cpu)
+
+        service_state = ServiceState(
             key=str(uuid4()),
-            value=PolicyDecisionValue(
+            value=ServiceStateValue(
                 service=event.value.service,
-                decision=decision_text,
-                risk_level=risk,
-                status=PolicyStatus.PENDING,
+                cloud=event.value.cloud,
                 timestamp=datetime.utcnow(),
+                belief=ServiceStateBelief(**belief),
+                intent=ServiceStateIntent(**intent),
                 metadata={
-                    "cloud": event.value.cloud.value,
-                    "belief": belief,
-                    "intent": intent,
                     "source_event_key": event.key,
+                    "metrics": metrics,
+                    "throughput": current_throughput,
+                    "memory_percent": memory_percent,
+                    "normalized_cpu": current_cpu,
+                    "normalized_error_rate": current_error,
                 },
                 correlation_id=event.value.correlation_id,
                 parent_event_id=event.value.parent_event_id,
             ),
         )
 
-        result = self.producer.send("policy.decisions", policy)
+        self.producer.send("service.state", service_state)
         logger.info(
-            "Published policy decision %s for %s@%s: %s",
-            policy.key,
+            "Published service state %s for %s@%s: desired_load=%s",
+            service_state.key,
             event.value.service,
             event.value.cloud.value,
-            decision_text,
+            intent["desired_load"],
         )
-        logger.debug("belief=%s intent=%s risk=%s", belief, intent, risk)
+        logger.debug("belief=%s intent=%s", belief, intent)
         return True
 
     @staticmethod
-    def _extract_latency(metrics: Dict[str, Any]) -> Optional[float]:
-        latency = metrics.get("latency_ms")
-        if latency is None:
+    def _extract_metric(metrics: Dict[str, Any], *keys: str) -> Optional[float]:
+        for key in keys:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _normalize_percentage(value: Optional[float]) -> Optional[float]:
+        if value is None:
             return None
-        try:
-            return float(latency)
-        except (TypeError, ValueError):
-            return None
+        normalized = float(value)
+        if normalized > 1.0:
+            normalized = normalized / 100.0
+        return round(max(min(normalized, 1.0), 0.0), 3)
 
     def close(self) -> None:
         super().close()

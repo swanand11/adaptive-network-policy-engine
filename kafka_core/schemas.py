@@ -5,8 +5,7 @@ PURPOSE:
   Ensures all events conform to their topic schema before sending/after receiving.
 
 SCHEMAS DEFINED:
-  - MetricsEvent: Raw metrics from services (metrics.events topic)
-  - AuditLogEvent: Audit trail for all actions (system.audit.log topic)
+  - MetricsEvent: Raw metrics from services (metrics.events topic)  - ServiceState: Local service state for reconciliation (service.state topic)  - AuditLogEvent: Audit trail for all actions (system.audit.log topic)
   - PolicyDecision: Agent decisions (policy.decisions topic)
   - PolicyExecution: Execution results (policy.executions topic)
 
@@ -80,6 +79,41 @@ class MetricsEvent(BaseModel):
     """Complete metrics event with key and value."""
     key: str = Field(..., description="Partition key (service_id)")
     value: MetricsEventValue
+
+
+class ServiceStateBelief(BaseModel):
+    """Local belief model for service state."""
+    latency_ewma: float = Field(..., description="EWMA-smoothed latency in ms")
+    trend: str = Field(..., description="Latency trend over the last window")
+    confidence: float = Field(..., description="Confidence in local state estimate")
+    status: str = Field(..., description="Service health status: healthy/stressed/overloaded")
+
+
+class ServiceStateIntent(BaseModel):
+    """Local intent model representing traffic share estimates."""
+    current_load: float = Field(..., description="Estimated current traffic share [0,1]")
+    desired_load: float = Field(..., description="Absolute desired traffic share [0,1]")
+
+
+class ServiceStateValue(BaseModel):
+    """Value schema for service.state topic."""
+    service: str = Field(..., description="Service identifier")
+    cloud: CloudProvider = Field(..., description="Cloud provider")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    belief: ServiceStateBelief = Field(..., description="Local belief about service health")
+    intent: ServiceStateIntent = Field(..., description="Local traffic intent")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+    correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
+    parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+
+    class Config:
+        use_enum_values = False
+
+
+class ServiceState(BaseModel):
+    """Complete service state event with key and value."""
+    key: str = Field(..., description="Partition key (service_id)")
+    value: ServiceStateValue
 
 
 # ============================================================

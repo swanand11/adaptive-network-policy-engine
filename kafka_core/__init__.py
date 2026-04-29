@@ -12,9 +12,15 @@ TOPICS (4 total):
      - Raw metrics from mock/real cloud services
      - Key: service_id@cloud_provider
      - Producers: service_adapters
-     - Consumers: service_agent, topography_agent, governance_agent
+     - Consumers: service_agent
 
-  2. system.audit.log (1 partition)
+  2. service.state (2 partitions)
+     - Local state estimates from Service Agents
+     - Key: service_id
+     - Producers: service_agent
+     - Consumers: topography_agent, governance_agent
+
+  3. system.audit.log (1 partition)
      - Audit trail for all actions and decisions
      - Key: event_id
      - Producers: all agents, executor, rollback_engine

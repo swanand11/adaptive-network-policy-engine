@@ -35,6 +35,7 @@ USAGE:
 
 TOPICS CREATED:
   - metrics.events (3 partitions): Raw metrics from services
+  - service.state (2 partitions): Local service state estimates
   - system.audit.log (1 partition): Audit trail
   - policy.decisions (2 partitions): Agent decisions
   - policy.executions (2 partitions): Execution results

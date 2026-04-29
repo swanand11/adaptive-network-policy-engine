@@ -90,6 +90,12 @@ class KafkaConfig:
             retention_ms=7 * 24 * 60 * 60 * 1000,
             partition_key_field="service_id",
         ),
+        "service.state": TopicConfig(
+            name="service.state",
+            partitions=2,
+            retention_ms=7 * 24 * 60 * 60 * 1000,
+            partition_key_field="service_id",
+        ),
         "system.audit.log": TopicConfig(
             name="system.audit.log",
             partitions=1,
