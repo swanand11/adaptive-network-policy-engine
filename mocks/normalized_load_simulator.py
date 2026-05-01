@@ -58,7 +58,7 @@ class NormalizedLoadSimulator:
         ]
 
         # Simulation parameters
-        self.update_interval = 3.0  # seconds
+        self.update_interval = 5.0  # seconds
         self.load_variation = 0.1   # random variation in load
         self.confidence_variation = 0.05  # random variation in confidence
 
@@ -122,21 +122,25 @@ class NormalizedLoadSimulator:
         else:
             logger.error(f"Failed to publish load update for {service['id']}")
 
-    def run_simulation(self, duration_seconds: int = 60):
+    def run_simulation(self, duration_seconds: int = None):
         """
-        Run the load simulation for a specified duration.
+        Run the load simulation continuously or for a specified duration.
 
         Args:
-            duration_seconds: How long to run the simulation
+            duration_seconds: How long to run the simulation. If None, runs indefinitely.
         """
         logger.info("Starting normalized load simulation")
         logger.info(f"Services: {[s['id'] for s in self.services]}")
+        logger.info(f"Sending events every {self.update_interval} seconds")
 
         start_time = time.time()
         iteration = 0
 
         try:
-            while time.time() - start_time < duration_seconds:
+            while True:
+                if duration_seconds is not None and time.time() - start_time >= duration_seconds:
+                    break
+                    
                 iteration += 1
                 logger.info(f"=== Iteration {iteration} ===")
 
@@ -180,6 +184,6 @@ if __name__ == "__main__":
         # Run imbalanced scenario for testing
         simulator.create_imbalanced_scenario()
     else:
-        # Run normal simulation
-        duration = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+        # Run continuous simulation (or for specified duration if provided)
+        duration = int(sys.argv[1]) if len(sys.argv) > 1 else None
         simulator.run_simulation(duration_seconds=duration)

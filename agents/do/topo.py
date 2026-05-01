@@ -68,10 +68,10 @@ class TopographyAgent(KafkaConsumerTemplate):
         self.global_state: Dict[str, Dict] = {}
 
         # Parameters
-        self.alpha = 0.2
-        self.beta = 0.1
-        self.temperature = 1.0
-        self.gamma = 0.01
+        self.alpha = 0.35
+        self.beta = 0.18
+        self.temperature = 1.2
+        self.gamma = 0.05
 
         # Processing state
         self.iteration_count = 0
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # For testing/development
     import sys
 
-    service_id = sys.argv[1] if len(sys.argv) > 1 else "aws"
+    service_id = sys.argv[1] if len(sys.argv) > 1 else "aks"
     agent = TopographyAgent(service_id=service_id)
 
     try:

@@ -68,10 +68,10 @@ class TopographyAgent(KafkaConsumerTemplate):
         self.global_state: Dict[str, Dict] = {}
 
         # Parameters
-        self.alpha = 0.2
-        self.beta = 0.1
-        self.temperature = 1.0
-        self.gamma = 0.01
+        self.alpha = 0.4
+        self.beta = 0.2
+        self.temperature = 1.5
+        self.gamma = 0.08
 
         # Processing state
         self.iteration_count = 0
@@ -325,7 +325,7 @@ class TopographyAgent(KafkaConsumerTemplate):
 
         # This is a simplified version - full implementation would require
         # adjacency matrix W_ij and noise term ξ_i
-        pass
+        TODO: Implementnoise and adjacency-based-refinement 
 
     def publish_actions(self, actions: List[Dict]):
         """
@@ -394,7 +394,7 @@ if __name__ == "__main__":
     # For testing/development
     import sys
 
-    service_id = sys.argv[1] if len(sys.argv) > 1 else "aws"
+    service_id = sys.argv[1] if len(sys.argv) > 1 else "aks"
     agent = TopographyAgent(service_id=service_id)
 
     try:
