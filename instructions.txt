@@ -32,3 +32,28 @@ cpu_usage_percent{cloud="aws",service_id="service-api"} 38.5
 # HELP error_rate_percent Error rate percentage
 # TYPE error_rate_percent gauge
 error_rate_percent{cloud="aws",service_id="service-api"} 0.7
+
+
+# 5. Test Topography Agent
+# The Topography Agent computes load redistribution actions based on normalized loads
+
+# Start the normalized load simulator (sends mock load data):
+python mocks/normalized_load_simulator.py 30
+
+# In another terminal, start the topography agent:
+python agents/aws/topo.py
+
+# Or run the integrated test:
+python test_topography.py
+
+# The agent will consume load updates and publish redistribution actions to policy.decisions topic
+
+# Expected behavior:
+# - Agent consumes normalized load messages from metrics.events
+# - Computes pressure = L_opt_i - L_i for each service
+# - Identifies overloaded (pressure < 0) and underloaded (pressure > 0) services
+# - Computes flow intensities between overloaded and underloaded services
+# - Publishes actions like: {"from": "aws", "to": "aks", "intensity": 0.15}
+
+# For imbalanced scenario testing:
+python mocks/normalized_load_simulator.py imbalanced
