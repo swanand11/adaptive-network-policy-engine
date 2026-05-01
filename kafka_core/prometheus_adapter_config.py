@@ -21,21 +21,22 @@ ENDPOINTS_CONFIG = {
     "aws": {
         "url": os.getenv("PROMETHEUS_AWS_URL", "http://aws-simulator:8001/metrics"),
         "service_id": "service-cache-aws",
-        "cloud": "AWS"  
+        "cloud": "AWS",
+        "partition": 0,
     },
     "aks": {
         "url": os.getenv("PROMETHEUS_AKS_URL", "http://aks-simulator:8002/metrics"),
-        "service_id": "service-cache-aks",
-        "cloud": "AKS"
+        "service_id": "service-db",
+        "cloud": "AZURE",
+        "partition": 1,
     },
     "droplet": {
         "url": os.getenv("PROMETHEUS_DO_URL", "http://digitalocean-simulator:8003/metrics"),
-        "service_id": "service-cache-droplet",
-        "cloud": "DIGITALOCEAN"
-    }
+        "service_id": "service-cache",
+        "cloud": "DIGITALOCEAN",
+        "partition": 2,
+    },
 }
-
-
 
 POLL_INTERVAL = int(os.getenv("PROMETHEUS_POLL_INTERVAL", "5"))  # seconds
 REQUEST_TIMEOUT = int(os.getenv("PROMETHEUS_TIMEOUT", "3"))  # seconds (shorter for 5s cycle)
@@ -60,7 +61,6 @@ METRICS_TO_EXTRACT = [
     'request_latency_seconds_sum',
     'request_latency_seconds_count',
     'request_count_total',
-    'error_count_total',
     'cpu_usage_percent',
     'memory_usage_percent',
     'error_rate_percent'
@@ -70,7 +70,6 @@ METRICS_TO_EXTRACT = [
 METRIC_FIELD_MAPPING = {
     'request_latency_seconds': 'request_latency_ms',
     'request_count_total': 'request_count',
-    'error_count_total': 'error_count',
     'cpu_usage_percent': 'cpu_usage_percent',
     'memory_usage_percent': 'memory_usage_percent',
     'error_rate_percent': 'error_rate_percent'

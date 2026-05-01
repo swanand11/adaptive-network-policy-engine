@@ -21,10 +21,9 @@ CONFIG:
 METRICS NORMALIZED:
   - request_latency_seconds: Summary (count, sum) → avg latency
   - request_count_total: Counter
-  - error_count_total: Counter
   - cpu_usage_percent: Gauge
   - memory_usage_percent: Gauge
-  - error_rate_percent: Gauge (calculated from error_count/request_count)
+  - error_rate_percent: Gauge
 
 DEPENDENCIES:
   - requests (HTTP polling)
@@ -45,6 +44,16 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+from .prometheus_adapter_config import (
+    ENDPOINTS_CONFIG,
+    POLL_INTERVAL,
+    REQUEST_TIMEOUT,
+    MAX_RETRIES,
+    BACKOFF_FACTOR,
+    KAFKA_TOPIC,
+    validate_config,
+)
+
 # Import Kafka schemas and producer
 try:
     from .schemas import MetricsEvent, MetricsEventValue
@@ -55,37 +64,15 @@ except ImportError as e:
     print("Make sure kafka package is in PYTHONPATH")
 
 
-# Prometheus endpoints with explicit partition assignment
 ENDPOINTS = {
-    "aws": {
-        "url": "http://aws-simulator:8001/metrics",
-        "cloud": CloudProvider.AWS,
-        "service_id": "service-cache-aws",
-        "partition": 0
-    },
-    "aks": {
-        "url": "http://aks-simulator:8002/metrics",
-        "cloud": CloudProvider.AZURE,
-        "service_id": "service-db",
-        "partition": 1
-    },
-    "droplet": {
-        "url": "http://digitalocean-simulator:8003/metrics",
-        "cloud": CloudProvider.DIGITALOCEAN,
-        "service_id": "service-cache",
-        "partition": 2
+    endpoint_name: {
+        "url": endpoint_config["url"],
+        "cloud": CloudProvider(endpoint_config["cloud"].lower()),
+        "service_id": endpoint_config["service_id"],
+        "partition": endpoint_config["partition"],
     }
+    for endpoint_name, endpoint_config in ENDPOINTS_CONFIG.items()
 }
-
-# Polling interval in seconds
-POLL_INTERVAL = 5  # Poll every 5 seconds (matches Prometheus refresh)
-
-# Request timeout
-REQUEST_TIMEOUT = 5  # seconds
-
-# Retry configuration for resilience
-MAX_RETRIES = 3
-BACKOFF_FACTOR = 0.5
 
 
 
@@ -184,7 +171,6 @@ class MetricsNormalizer:
         normalized = {
             'request_latency_ms': None,
             'request_count': None,
-            'error_count': None,
             'error_rate_percent': None,
             'cpu_usage_percent': None,
             'memory_usage_percent': None,
@@ -209,21 +195,12 @@ class MetricsNormalizer:
             except (IndexError, KeyError) as e:
                 logger.warning(f"Could not extract request_count: {e}")
         
-        # Extract error count
-        if 'error_count_total' in parsed_metrics:
-            try:
-                normalized['error_count'] = int(parsed_metrics['error_count_total'][0]['value'])
-            except (IndexError, KeyError) as e:
-                logger.warning(f"Could not extract error_count: {e}")
-        
-        # Calculate error rate if possible (from gauge or computed)
+        # Extract error rate from gauge
         if 'error_rate_percent' in parsed_metrics:
             try:
                 normalized['error_rate_percent'] = parsed_metrics['error_rate_percent'][0]['value']
             except (IndexError, KeyError) as e:
                 logger.warning(f"Could not extract error_rate_percent: {e}")
-        elif normalized['request_count'] and normalized['error_count']:
-            normalized['error_rate_percent'] = (normalized['error_count'] / normalized['request_count']) * 100
         
         # Extract CPU usage
         if 'cpu_usage_percent' in parsed_metrics:
@@ -358,10 +335,11 @@ class PrometheusMetricsAdapter:
                 
                 # Send to Kafka with explicit partition assignment
                 try:
-                    record_meta = self.producer.send("metrics.events", event, partition=target_partition)
+                    record_meta = self.producer.send(KAFKA_TOPIC, event, partition=target_partition)
                     logger.info(
-                        "Sent metrics for %s to metrics.events with key='%s' partition=%s: %s",
+                        "Sent metrics for %s to %s with key='%s' partition=%s: %s",
                         endpoint_name,
+                        KAFKA_TOPIC,
                         partition_key,
                         target_partition,
                         record_meta,
@@ -412,21 +390,24 @@ class PrometheusMetricsAdapter:
 def main():
     """Main entry point."""
     logger.info("Initializing Prometheus Metrics Adapter")
-    
+
+    if not validate_config():
+        raise RuntimeError("Invalid Prometheus adapter configuration")
+
     try:
         # Initialize producer
         logger.info("Initializing Kafka producer")
         producer = KafkaProducerTemplate()
-        
+
         # Initialize and start adapter
         adapter = PrometheusMetricsAdapter(
             producer=producer,
             endpoints=ENDPOINTS,
             poll_interval=POLL_INTERVAL
         )
-        
+
         adapter.start()
-    
+
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         raise

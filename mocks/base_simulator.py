@@ -50,12 +50,6 @@ class BaseSimulator(ABC):
             ['cloud', 'service_id'],
             registry=self.registry
         )
-        self.error_count = Counter(
-            'error_count_total',
-            'Total errors',
-            ['cloud', 'service_id'],
-            registry=self.registry
-        )
         self.cpu_usage = Gauge(
             'cpu_usage_percent',
             'CPU usage percentage',
@@ -125,10 +119,6 @@ class BaseSimulator(ABC):
         # Record error rate
         error_rate = metrics_data.get("error_rate", 0.5)
         self.error_rate.labels(**cloud_labels).set(error_rate)
-        
-        # Simulate errors
-        if random.random() < (error_rate / 100):
-            self.error_count.labels(**cloud_labels).inc()
 
     @abstractmethod
     def generate_metrics(self) -> Dict[str, Any]:
