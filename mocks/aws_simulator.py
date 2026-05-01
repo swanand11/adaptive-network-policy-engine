@@ -7,7 +7,7 @@ from mocks.base_simulator import BaseSimulator
 class AWSSimulator(BaseSimulator):
     """Simulates AWS EC2/ECS service metrics."""
 
-    def __init__(self, service_name: str = "service-api", service_port: int = 8001):
+    def __init__(self, service_name: str = "service-cache-aws", service_port: int = 8001):
         super().__init__(service_name, "aws", service_port, service_port)
         self.latency_baseline = 45  # AWS typically lower latency
         self.cpu_baseline = 35

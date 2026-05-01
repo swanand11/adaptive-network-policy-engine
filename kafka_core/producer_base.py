@@ -121,13 +121,14 @@ class KafkaProducerTemplate:
             logger.error(f"Failed to initialize Kafka Producer: {e}")
             raise KafkaProducerError(f"Producer initialization failed: {e}")
 
-    def send(self, topic: str, event: BaseModel) -> str:
+    def send(self, topic: str, event: BaseModel, partition: int = None) -> str:
         """
         Send event to Kafka topic (blocking).
         
         Args:
             topic: Kafka topic name
             event: Pydantic model with 'key' and 'value' fields
+            partition: Optional explicit partition number. If specified, overrides key-based partitioning.
             
         Returns:
             Record metadata string (topic@partition:offset)
@@ -144,11 +145,14 @@ class KafkaProducerTemplate:
             value = event.value if hasattr(event, "value") else event
 
             # Send to Kafka
-            future = self.producer.send(
-                topic,
-                key=key,
-                value=value.dict() if isinstance(value, BaseModel) else value,
-            )
+            send_kwargs = {
+                "key": key,
+                "value": value.dict() if isinstance(value, BaseModel) else value,
+            }
+            if partition is not None:
+                send_kwargs["partition"] = partition
+            
+            future = self.producer.send(topic, **send_kwargs)
 
             # Block until send completes
             record_metadata = future.get(timeout=10)

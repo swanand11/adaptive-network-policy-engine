@@ -55,22 +55,25 @@ except ImportError as e:
     print("Make sure kafka package is in PYTHONPATH")
 
 
-# Prometheus endpoints
+# Prometheus endpoints with explicit partition assignment
 ENDPOINTS = {
     "aws": {
         "url": "http://aws-simulator:8001/metrics",
         "cloud": CloudProvider.AWS,
-        "service_id": "service-cache-aws"
+        "service_id": "service-cache-aws",
+        "partition": 0
     },
     "aks": {
         "url": "http://aks-simulator:8002/metrics",
         "cloud": CloudProvider.AZURE,
-        "service_id": "service-cache-aks"
+        "service_id": "service-db",
+        "partition": 1
     },
     "droplet": {
         "url": "http://digitalocean-simulator:8003/metrics",
         "cloud": CloudProvider.DIGITALOCEAN,
-        "service_id": "service-cache-droplet"
+        "service_id": "service-cache",
+        "partition": 2
     }
 }
 
@@ -308,6 +311,9 @@ class PrometheusMetricsAdapter:
         self.parser = PrometheusParser()
         self.normalizer = MetricsNormalizer()
         self.running = False
+        logger.info(
+            "metrics.events key routing enabled: using service_id as key with explicit partition assignment (service-cache-aws→0, service-db→1, service-cache→2)"
+        )
     
     def poll_and_send(self) -> bool:
         """Poll all endpoints, normalize, and send to Kafka.
@@ -336,9 +342,9 @@ class PrometheusMetricsAdapter:
                 normalized = self.normalizer.normalize(parsed_metrics)
                 logger.debug(f"Normalized metrics for {endpoint_name}: {normalized}")
                 
-                # Create Kafka event with partition key: cloud+service
-                # This ensures all metrics from same service/cloud go to same partition
-                partition_key = f"{config['cloud'].value.lower()}:{config['service_id']}"
+                # Use service_id as key, but explicitly route to assigned partition for balanced distribution
+                partition_key = config['service_id']
+                target_partition = config['partition']
                 event = MetricsEvent(
                     key=partition_key,
                     value=MetricsEventValue(
@@ -350,10 +356,16 @@ class PrometheusMetricsAdapter:
                     )
                 )
                 
-                # Send to Kafka
+                # Send to Kafka with explicit partition assignment
                 try:
-                    record_meta = self.producer.send("metrics.events", event)
-                    logger.info(f"Sent metrics for {endpoint_name} to Kafka: {record_meta}")
+                    record_meta = self.producer.send("metrics.events", event, partition=target_partition)
+                    logger.info(
+                        "Sent metrics for %s to metrics.events with key='%s' partition=%s: %s",
+                        endpoint_name,
+                        partition_key,
+                        target_partition,
+                        record_meta,
+                    )
                 except Exception as e:
                     logger.error(f"Failed to send {endpoint_name} metrics to Kafka: {e}")
                     all_success = False

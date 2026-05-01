@@ -206,3 +206,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .env
+
+# Local test reports and conversation artifacts
+reports/
+conversations/
+.gitkeep

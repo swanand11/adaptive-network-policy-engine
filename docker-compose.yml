@@ -167,10 +167,44 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: service-agent
-    command: python service_agent_runner.py
+    command: python runners/service_agent_runner.py
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       SERVICE_ID: "service-cache-aws"
+      LOG_LEVEL: "INFO"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      - kafka
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  service-agent-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: service-agent-2
+    command: python runners/service_agent_runner.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      SERVICE_ID: "service-db"
+      LOG_LEVEL: "INFO"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      - kafka
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  service-agent-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: service-agent-3
+    command: python runners/service_agent_runner.py
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      SERVICE_ID: "service-cache"
       LOG_LEVEL: "INFO"
       PYTHONUNBUFFERED: "1"
     depends_on:

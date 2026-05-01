@@ -2,55 +2,19 @@
 
 PURPOSE:
   Pydantic models for validating and serializing Kafka events.
-  Ensures all events conform to their topic schema before sending/after receiving.
 
-SCHEMAS DEFINED:
-  - MetricsEvent: Raw metrics from services (metrics.events topic)  - ServiceState: Local service state for reconciliation (service.state topic)  - AuditLogEvent: Audit trail for all actions (system.audit.log topic)
-  - PolicyDecision: Agent decisions (policy.decisions topic)
-  - PolicyExecution: Execution results (policy.executions topic)
-
-KEY FIELDS (all events):
-  - key: Partition key (service_id, event_id, decision_id, execution_id)
-  - value: Event payload (Pydantic model with validation)
-  - timestamp: Event creation time
-
-USAGE:
-  from kafka.schemas import MetricsEvent, MetricsEventValue, PolicyDecision
-  from kafka.enums import CloudProvider
-  from datetime import datetime
-  
-  # Create and validate an event
-  event = MetricsEvent(
-      key="service-api@aws",  # Partition key
-      value=MetricsEventValue(
-          service="service-api",
-          cloud=CloudProvider.AWS,
-          timestamp=datetime.now(),
-          metrics={"latency_ms": 100, "error_rate": 0.01}
-      )
-  )
-  
-  # Validation happens automatically
-  # Pass to producer: producer.send("metrics.events", event)
-  
-  # Deserialize received event
-  received_dict = {"key": "...", "value": {...}}
-  event = MetricsEvent(**received_dict)  # Auto-validates
-
-VALIDATION:
-  - Pydantic enforces type checking
-  - Required fields must be present
-  - Enum fields must be valid values
-  - Raises ValidationError if schema doesn't match
-
-EXTENSION:
-  Add new schema models for new topics.
-  Update producer/consumer to handle new schemas.
+NOTES:
+  - The canonical input format for the `metrics.events` topic is the
+    flat adapter payload represented by `MetricsEventValue`. Producers
+    (the Prometheus adapter) SHOULD send the flat JSON as the message
+    value. Consumers SHOULD validate incoming message values against
+    `MetricsEventValue`.
+  - A legacy wrapped envelope model `MetricsEvent(key, value)` is kept
+    for backward compatibility but is considered deprecated.
 
 DEPENDENCIES:
   - kafka.enums (CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel)
   - pydantic (validation)
-
 """
 
 from typing import Any, Dict, Optional
@@ -60,10 +24,14 @@ from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
 
 
 # ============================================================
-# Metrics Events Topic Schema
+# Metrics Events Topic Schema (canonical flat payload)
 # ============================================================
 class MetricsEventValue(BaseModel):
-    """Value schema for metrics.events topic."""
+    """Value schema for `metrics.events` topic (flat adapter payload).
+
+    Example payload produced by the Prometheus adapter should match this
+    model (service, cloud, timestamp, metrics, correlation_id, parent_event_id).
+    """
     service: str = Field(..., description="Service identifier")
     cloud: CloudProvider = Field(..., description="Cloud provider")
     timestamp: datetime = Field(..., description="Event timestamp")
@@ -76,11 +44,19 @@ class MetricsEventValue(BaseModel):
 
 
 class MetricsEvent(BaseModel):
-    """Complete metrics event with key and value."""
-    key: str = Field(..., description="Partition key (service_id)")
-    value: MetricsEventValue
+    """(Deprecated) Wrapped metrics event with key and value.
+
+    This model exists for backward compatibility with earlier code that
+    used a `{key, value}` envelope. New code should prefer `MetricsEventValue`
+    as the canonical payload for `metrics.events`.
+    """
+    key: Optional[str] = Field(None, description="Partition key (service_id)")
+    value: Optional[MetricsEventValue] = None
 
 
+# ============================================================
+# Service State Topic Schemas
+# ============================================================
 class ServiceStateBelief(BaseModel):
     """Local belief model for service state."""
     latency_ewma: float = Field(..., description="EWMA-smoothed latency in ms")
@@ -92,11 +68,11 @@ class ServiceStateBelief(BaseModel):
 class ServiceStateIntent(BaseModel):
     """Local intent model representing traffic share estimates."""
     current_load: float = Field(..., description="Estimated current traffic share [0,1]")
-    desired_load: float = Field(..., description="Absolute desired traffic share [0,1]")
+    optimal_load: float = Field(..., description="Optimal traffic share [0,1] derived from EWMA latency")
 
 
 class ServiceStateValue(BaseModel):
-    """Value schema for service.state topic."""
+    """Value schema for `service.state` topic."""
     service: str = Field(..., description="Service identifier")
     cloud: CloudProvider = Field(..., description="Cloud provider")
     timestamp: datetime = Field(..., description="Event timestamp")

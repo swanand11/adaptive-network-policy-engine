@@ -1,81 +1,15 @@
-"""Kafka Topic Initializer Module
+"""Kafka Topic Initializer Module.
 
-PURPOSE:
-  Automatically creates Kafka topics on application startup.
-  Idempotent (safe to run multiple times, doesn't error if topics exist).
-  Single entry point for all topic initialization.
-
-KEY CLASS:
-  - TopicInitializer: Manages topic creation
-    - create_all_topics(): Create all 4 topics (idempotent)
-    - create_topic(topic_name): Create single topic
-    - delete_topic(topic_name): Delete topic (testing only)
-    - list_topics(): List all topics in cluster
-
-FUNCTION:
-  - initialize_kafka_topics(): Convenience function, calls create_all_topics()
-
-USAGE:
-  from kafka.topic_initializer import initialize_kafka_topics
-  
-  # On application startup (main or app factory)
-  success = initialize_kafka_topics()
-  if success:
-      print("Topics initialized successfully")
-  else:
-      print("Topic initialization failed (check logs)")
-  
-  # Or use TopicInitializer class directly
-  from kafka.topic_initializer import TopicInitializer
-  
-  initializer = TopicInitializer()
-  initializer.create_all_topics()  # Create all 4 topics
-  topics = initializer.list_topics()  # List existing topics
-  print(f"Topics: {topics}")
-
-TOPICS CREATED:
-  - metrics.events (3 partitions): Raw metrics from services
-  - service.state (2 partitions): Local service state estimates
-  - system.audit.log (1 partition): Audit trail
-  - policy.decisions (2 partitions): Agent decisions
-  - policy.executions (2 partitions): Execution results
-
-IDEMPOTENCY:
-  - Topics are only created if they don't exist
-  - Existing topics are skipped
-  - Safe to call on every app startup
-
-CALLED FROM:
-  - Application initialization (main entry point)
-  - Docker entrypoint script
-  - Test setup (pytest fixtures)
-
-ERROR HANDLING:
-  - TopicAlreadyExistsError: Caught and ignored (idempotent)
-  - Other KafkaErrors: Logged and re-raised
-  - Returns False if topics already exist (expected), True if created
-
-CONFIGURATION:
-  - Topic configs come from kafka.config.KafkaConfig.TOPICS
-  - Partitions, retention, and partition key defined there
-
-DEBUGGING:
-  - Enable DEBUG logging to see topic creation details
-  - list_topics() shows current topics in cluster
-
-DEPENDENCIES:
-  - kafka.admin (KafkaAdminClient, NewTopic)
-  - kafka.config (KafkaConfig, TopicConfig)
-  - kafka.exceptions (TopicInitializationError)
+Creates configured Kafka topics at startup and validates partitioning.
 """
 
 import logging
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
-from kafka.admin import KafkaAdminClient, NewTopic
-from kafka.errors import TopicAlreadyExistsError, KafkaError
+from kafka.admin import KafkaAdminClient, NewPartitions, NewTopic
+from kafka.errors import TopicAlreadyExistsError
 
-from .config import KafkaConfig, TopicConfig
+from .config import KafkaConfig
 from .exceptions import TopicInitializationError
 
 
@@ -83,21 +17,9 @@ logger = logging.getLogger(__name__)
 
 
 class TopicInitializer:
-    """
-    Initialize Kafka topics automatically.
-    
-    Usage:
-        initializer = TopicInitializer()
-        initializer.create_all_topics()
-    """
+    """Initialize Kafka topics automatically."""
 
     def __init__(self, bootstrap_servers: Optional[List[str]] = None):
-        """
-        Initialize TopicInitializer.
-        
-        Args:
-            bootstrap_servers: Kafka broker addresses
-        """
         self.bootstrap_servers = bootstrap_servers or KafkaConfig.BOOTSTRAP_SERVERS
         self.admin_client = None
         self._initialize_admin_client()
@@ -109,10 +31,85 @@ class TopicInitializer:
                 bootstrap_servers=self.bootstrap_servers,
                 request_timeout_ms=10000,
             )
-            logger.info(f"Kafka Admin Client initialized with brokers: {self.bootstrap_servers}")
+            logger.info("Kafka Admin Client initialized with brokers: %s", self.bootstrap_servers)
         except Exception as e:
-            logger.error(f"Failed to initialize Kafka Admin Client: {e}")
+            logger.error("Failed to initialize Kafka Admin Client: %s", e)
             raise TopicInitializationError(f"Admin client init failed: {e}")
+
+    def _get_topic_partition_count(self, topic_name: str) -> Optional[int]:
+        """Return current partition count for topic, or None when unavailable."""
+        if not self.admin_client:
+            raise TopicInitializationError("Admin client not initialized")
+
+        try:
+            metadata = self.admin_client.describe_topics(topics=[topic_name])
+            if isinstance(metadata, list) and metadata:
+                return len(metadata[0].get("partitions", []))
+            if isinstance(metadata, dict):
+                topic_meta = metadata.get(topic_name)
+                if topic_meta:
+                    return len(topic_meta.get("partitions", []))
+            return None
+        except Exception as e:
+            logger.error("Failed to inspect partitions for topic '%s': %s", topic_name, e)
+            return None
+
+    def _ensure_min_partitions(self, topic_name: str, min_partitions: int) -> bool:
+        """Ensure topic has at least min_partitions by increasing when needed."""
+        if not self.admin_client:
+            raise TopicInitializationError("Admin client not initialized")
+
+        current = self._get_topic_partition_count(topic_name)
+        if current is None:
+            return False
+
+        if current >= min_partitions:
+            logger.info(
+                "Topic '%s' partition config OK: current=%s required=%s",
+                topic_name,
+                current,
+                min_partitions,
+            )
+            return True
+
+        try:
+            response = self.admin_client.create_partitions(
+                {topic_name: NewPartitions(total_count=min_partitions)},
+                validate_only=False,
+            )
+
+            # kafka-python versions differ here:
+            # - newer: dict(topic -> future)
+            # - older: CreatePartitionsResponse
+            if hasattr(response, "items"):
+                for topic, future in response.items():
+                    future.result(timeout=10)
+                    logger.info(
+                        "Increased partitions for topic '%s' from %s to %s",
+                        topic,
+                        current,
+                        min_partitions,
+                    )
+            else:
+                updated = self._get_topic_partition_count(topic_name)
+                if updated is None or updated < min_partitions:
+                    logger.error(
+                        "Partition increase response received but topic '%s' still has %s partitions",
+                        topic_name,
+                        updated,
+                    )
+                    return False
+                logger.info(
+                    "Increased partitions for topic '%s' from %s to %s",
+                    topic_name,
+                    current,
+                    updated,
+                )
+
+            return True
+        except Exception as e:
+            logger.error("Failed to increase partitions for topic '%s': %s", topic_name, e)
+            return False
 
     def create_topic(
         self,
@@ -120,23 +117,12 @@ class TopicInitializer:
         num_partitions: Optional[int] = None,
         replication_factor: Optional[int] = None,
     ) -> bool:
-        """
-        Create a single topic.
-        
-        Args:
-            topic_name: Name of topic
-            num_partitions: Number of partitions (uses config if not provided)
-            replication_factor: Replication factor (uses config if not provided)
-            
-        Returns:
-            True if topic created or already exists, False on error
-        """
+        """Create topic if missing; validate/adjust existing topic when needed."""
         if not self.admin_client:
             raise TopicInitializationError("Admin client not initialized")
 
-        # Get topic config
         if topic_name not in KafkaConfig.TOPICS:
-            logger.warning(f"Topic '{topic_name}' not found in configuration")
+            logger.warning("Topic '%s' not found in configuration", topic_name)
             return False
 
         topic_config = KafkaConfig.TOPICS[topic_name]
@@ -144,130 +130,110 @@ class TopicInitializer:
         replication_factor = replication_factor or topic_config.replication_factor
 
         try:
-            # Create NewTopic object
             new_topic = NewTopic(
                 name=topic_name,
                 num_partitions=num_partitions,
                 replication_factor=replication_factor,
                 topic_configs=topic_config.to_kafka_config()["config"],
             )
-
-            # Create topic
-            fs = self.admin_client.create_topics(new_topics=[new_topic], validate_only=False)
-            
-            # Wait for creation
-            for topic, future in fs.items():
+            futures = self.admin_client.create_topics(new_topics=[new_topic], validate_only=False)
+            for topic, future in futures.items():
                 try:
-                    future.result(timeout_sec=10)
+                    future.result(timeout=10)
                     logger.info(
-                        f"Topic created: '{topic}' "
-                        f"(partitions={num_partitions}, replication_factor={replication_factor})"
+                        "Topic created: '%s' (partitions=%s, replication_factor=%s)",
+                        topic,
+                        num_partitions,
+                        replication_factor,
                     )
-                    return True
                 except TopicAlreadyExistsError:
-                    logger.info(f"Topic already exists: '{topic}'")
-                    return True
-
+                    logger.info("Topic already exists: '%s'", topic)
+        except TopicAlreadyExistsError:
+            logger.info("Topic already exists: '%s'", topic_name)
         except Exception as e:
-            logger.error(f"Error creating topic '{topic_name}': {e}")
+            logger.error("Error creating topic '%s': %s", topic_name, e)
             return False
 
+        # Enforce metrics.events partition requirement.
+        if topic_name == "metrics.events":
+            return self._ensure_min_partitions(topic_name, 3)
+        return True
+
     def create_all_topics(self) -> Dict[str, bool]:
-        """
-        Create all topics from configuration.
-        
-        Returns:
-            Dict mapping topic_name -> success (bool)
-        """
-        results = {}
-        
-        logger.info(f"Creating {len(KafkaConfig.TOPICS)} topics...")
+        """Create all configured topics and log startup partition state."""
+        results: Dict[str, bool] = {}
+        logger.info("Creating %s topics...", len(KafkaConfig.TOPICS))
 
         for topic_name in KafkaConfig.TOPICS:
             results[topic_name] = self.create_topic(topic_name)
 
-        # Log summary
-        success_count = sum(1 for v in results.values() if v)
-        logger.info(f"Topic creation summary: {success_count}/{len(results)} successful")
+        success_count = sum(1 for ok in results.values() if ok)
+        logger.info("Topic creation summary: %s/%s successful", success_count, len(results))
+
+        metrics_partitions = self._get_topic_partition_count("metrics.events")
+        if metrics_partitions is not None:
+            logger.info(
+                "Partition configuration at startup: topic='metrics.events', partitions=%s, required=%s",
+                metrics_partitions,
+                3,
+            )
+        else:
+            logger.warning("Could not verify startup partition configuration for 'metrics.events'")
 
         return results
 
     def delete_topic(self, topic_name: str) -> bool:
-        """
-        Delete a topic.
-        
-        Args:
-            topic_name: Name of topic to delete
-            
-        Returns:
-            True if deleted, False if error
-        """
+        """Delete a topic."""
         if not self.admin_client:
             raise TopicInitializationError("Admin client not initialized")
 
         try:
-            fs = self.admin_client.delete_topics(topics=[topic_name])
-            for topic, future in fs.items():
-                future.result(timeout_sec=10)
-                logger.info(f"Topic deleted: '{topic}'")
+            futures = self.admin_client.delete_topics(topics=[topic_name])
+            for topic, future in futures.items():
+                future.result(timeout=10)
+                logger.info("Topic deleted: '%s'", topic)
                 return True
         except Exception as e:
-            logger.error(f"Error deleting topic '{topic_name}': {e}")
+            logger.error("Error deleting topic '%s': %s", topic_name, e)
             return False
 
     def delete_all_topics(self) -> Dict[str, bool]:
-        """
-        Delete all configured topics.
-        
-        Returns:
-            Dict mapping topic_name -> success (bool)
-        """
-        results = {}
+        """Delete all configured topics."""
+        results: Dict[str, bool] = {}
         logger.warning("Deleting all configured topics...")
 
         for topic_name in KafkaConfig.TOPICS:
             results[topic_name] = self.delete_topic(topic_name)
 
-        success_count = sum(1 for v in results.values() if v)
-        logger.warning(f"Topic deletion summary: {success_count}/{len(results)} successful")
-
+        success_count = sum(1 for ok in results.values() if ok)
+        logger.warning("Topic deletion summary: %s/%s successful", success_count, len(results))
         return results
 
     def list_topics(self) -> Dict[str, Dict]:
-        """
-        List all topics on broker.
-        
-        Returns:
-            Dict of topic_name -> topic_metadata
-        """
+        """List configured topics on broker."""
         if not self.admin_client:
             raise TopicInitializationError("Admin client not initialized")
 
         try:
-            metadata = self.admin_client.describe_topics(topics=list(KafkaConfig.TOPICS.keys()))
-            return metadata
+            return self.admin_client.describe_topics(topics=list(KafkaConfig.TOPICS.keys()))
         except Exception as e:
-            logger.error(f"Error listing topics: {e}")
+            logger.error("Error listing topics: %s", e)
             return {}
 
     def get_topic_info(self, topic_name: str) -> Optional[Dict]:
-        """
-        Get detailed info about a topic.
-        
-        Args:
-            topic_name: Name of topic
-            
-        Returns:
-            Topic metadata dict or None
-        """
+        """Get detailed metadata for one topic."""
         if not self.admin_client:
             raise TopicInitializationError("Admin client not initialized")
 
         try:
             metadata = self.admin_client.describe_topics(topics=[topic_name])
-            return metadata.get(topic_name)
+            if isinstance(metadata, list) and metadata:
+                return metadata[0]
+            if isinstance(metadata, dict):
+                return metadata.get(topic_name)
+            return None
         except Exception as e:
-            logger.error(f"Error getting info for topic '{topic_name}': {e}")
+            logger.error("Error getting info for topic '%s': %s", topic_name, e)
             return None
 
     def close(self) -> None:
@@ -277,27 +243,19 @@ class TopicInitializer:
             logger.info("Kafka Admin Client closed")
 
     def __enter__(self):
-        """Context manager entry."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
         self.close()
 
 
-# Convenience function for initialization
 def initialize_kafka_topics() -> bool:
-    """
-    Initialize all Kafka topics.
-    
-    Returns:
-        True if all topics created successfully
-    """
+    """Initialize all Kafka topics."""
     try:
         initializer = TopicInitializer()
         results = initializer.create_all_topics()
         initializer.close()
         return all(results.values())
     except TopicInitializationError as e:
-        logger.error(f"Topic initialization failed: {e}")
+        logger.error("Topic initialization failed: %s", e)
         return False

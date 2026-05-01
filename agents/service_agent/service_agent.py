@@ -6,12 +6,13 @@ from uuid import uuid4
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
 from kafka_core.schemas import (
-    MetricsEvent,
+    MetricsEventValue,
     ServiceState,
     ServiceStateValue,
     ServiceStateBelief,
     ServiceStateIntent,
 )
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +123,6 @@ class ServiceAgent(KafkaConsumerTemplate):
         current_load = 1.0 - penalty
         return round(max(min(current_load, 0.95), 0.05), 2)
 
-    def derive_desired_load(self, current_load: float, status: str) -> float:
-        if status == "overloaded":
-            return round(max(current_load - 0.25, 0.0), 2)
-        if status == "stressed":
-            return round(max(current_load - 0.1, 0.0), 2)
-        return round(min(current_load + 0.05, 1.0), 2)
-
     def build_belief(
         self,
         current_latency: float,
@@ -159,18 +153,21 @@ class ServiceAgent(KafkaConsumerTemplate):
             error_rate=current_error,
             cpu=current_cpu,
         )
-        desired_load = self.derive_desired_load(current_load, belief["status"])
+        # Compute optimal_load from EWMA latency only
+        ewma = belief["latency_ewma"]
+        r = ewma / float(self.latency_threshold) if self.latency_threshold else 1.0
+        optimal_load = round(max(min(1.0 - r / 2.0, 0.95), 0.05), 2)
 
         return {
             "current_load": current_load,
-            "desired_load": desired_load,
+            "optimal_load": optimal_load,
         }
 
     def process_message(self, topic: str, message: Dict[str, Any]) -> bool:
         try:
-            event = MetricsEvent(**message)
+            event = self._parse_metrics_event(message)
         except Exception as exc:
-            logger.error(f"Invalid metrics event: {exc} | message={message}")
+            logger.error(f"Invalid metrics event (expected flat Shape B): {exc} | message={message}")
             return False
 
         if event.value.service != self.service_id:
@@ -182,17 +179,17 @@ class ServiceAgent(KafkaConsumerTemplate):
             return True
 
         metrics = event.value.metrics
-        current_latency = self._extract_metric(metrics, "latency_ms")
+        current_latency = self._extract_metric(metrics, "latency_ms", "request_latency_ms")
         if current_latency is None:
             logger.warning("Skipping metrics event without latency_ms")
             return True
 
-        raw_error = self._extract_metric(metrics, "error_rate")
-        raw_cpu = self._extract_metric(metrics, "cpu_percent", "cpu")
+        raw_error = self._extract_metric(metrics, "error_rate", "error_rate_percent")
+        raw_cpu = self._extract_metric(metrics, "cpu_percent", "cpu", "cpu_usage_percent")
         current_error = self._normalize_percentage(raw_error)
         current_cpu = self._normalize_percentage(raw_cpu)
-        current_throughput = self._extract_metric(metrics, "throughput", "requests_per_sec")
-        memory_percent = self._extract_metric(metrics, "memory_percent", "memory")
+        current_throughput = self._extract_metric(metrics, "throughput", "requests_per_sec", "request_count")
+        memory_percent = self._extract_metric(metrics, "memory_percent", "memory", "memory_usage_percent")
 
         belief = self.build_belief(current_latency, current_error, current_cpu)
         intent = self.build_intent(belief, current_error, current_cpu)
@@ -220,11 +217,11 @@ class ServiceAgent(KafkaConsumerTemplate):
 
         self.producer.send("service.state", service_state)
         logger.info(
-            "Published service state %s for %s@%s: desired_load=%s",
+            "Published service state %s for %s@%s: optimal_load=%s",
             service_state.key,
             event.value.service,
             event.value.cloud.value,
-            intent["desired_load"],
+            intent.get("optimal_load", None),
         )
         logger.debug("belief=%s intent=%s", belief, intent)
         return True
@@ -249,6 +246,19 @@ class ServiceAgent(KafkaConsumerTemplate):
         if normalized > 1.0:
             normalized = normalized / 100.0
         return round(max(min(normalized, 1.0), 0.0), 3)
+
+    def _parse_metrics_event(self, message: Dict[str, Any]) -> MetricsEventValue:
+        """Parse the flat adapter payload (Shape B) only.
+
+        Expects `message` to be the flat JSON with fields matching
+        `MetricsEventValue`. Constructs a simple object with `key` and
+        `value` attributes for compatibility with the rest of the code.
+        """
+        flat_value = MetricsEventValue(**message)
+        # cloud may be an Enum; derive a stable partition key string
+        cloud_part = getattr(flat_value.cloud, "value", str(flat_value.cloud))
+        partition_key = f"{flat_value.service}@{cloud_part}"
+        return SimpleNamespace(key=partition_key, value=flat_value)
 
     def close(self) -> None:
         super().close()
