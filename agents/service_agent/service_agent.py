@@ -76,31 +76,6 @@ class ServiceAgent(KafkaConsumerTemplate):
         score = 1.0 - min((latency_spread / 100.0), 0.5) - min((error_spread / 0.1), 0.3)
         return round(max(min(score, 0.95), 0.5), 2)
 
-    def classify_status(
-        self,
-        latency: float,
-        error_rate: Optional[float],
-        cpu: Optional[float],
-    ) -> str:
-        overloaded_conditions = [latency > self.latency_threshold]
-        if error_rate is not None:
-            overloaded_conditions.append(error_rate >= self.error_threshold)
-        if cpu is not None:
-            overloaded_conditions.append(cpu >= self.cpu_threshold)
-
-        if any(overloaded_conditions):
-            return "overloaded"
-
-        stressed_conditions = [latency > self.latency_threshold * 0.8]
-        if error_rate is not None:
-            stressed_conditions.append(error_rate >= self.error_threshold * 0.6)
-        if cpu is not None:
-            stressed_conditions.append(cpu >= self.cpu_threshold * 0.75)
-
-        if any(stressed_conditions):
-            return "stressed"
-
-        return "healthy"
 
     def estimate_current_load(
         self,
@@ -133,13 +108,11 @@ class ServiceAgent(KafkaConsumerTemplate):
         self.update_window(current_latency, current_error)
         trend_value = self.compute_trend()
         confidence = self.compute_confidence()
-        status = self.classify_status(current_latency, current_error, current_cpu)
 
         return {
             "latency_ewma": round(ewma, 2),
             "trend": f"{'+ ' if trend_value >= 0 else ''}{round(trend_value, 2)}ms".replace('+ ', '+'),
             "confidence": confidence,
-            "status": status,
         }
 
     def build_intent(
