@@ -1,29 +1,17 @@
+
 import time
 import json
 
 from agents.aws.topo import TopographyAgent as AWSTopo
 from agents.aks.topo import TopographyAgent as AKSTopo
 from agents.do.topo import TopographyAgent as DOTopo
-
+from kafka_core.producer_base import KafkaProducerTemplate
 from mocks.normalized_load_simulator import NormalizedLoadSimulator
 
 
 # ---------------------------------------------------------------------------
-# Mock Kafka
+# Mock Consumer (we still mock input side)
 # ---------------------------------------------------------------------------
-
-class MockProducer:
-    def __init__(self, name):
-        self.name = name
-        self.sent_events = []
-
-    def send(self, topic, event):
-        self.sent_events.append((topic, event))
-        return True
-
-    def close(self):
-        pass
-
 
 class MockConsumer:
     def close(self):
@@ -59,14 +47,14 @@ def main():
     simulator.services[1]["baseline_L"] = 0.2
     simulator.services[2]["baseline_L"] = 0.35
 
-    # Create ALL agents
+    # Create ALL agents with REAL Kafka producer
     agents = {
-        "aws": AWSTopo("aws", MockConsumer(), MockProducer("aws")),
-        "aks": AKSTopo("aks", MockConsumer(), MockProducer("aks")),
-        "do":  DOTopo("do",  MockConsumer(), MockProducer("do")),
+        "aws": AWSTopo("aws", MockConsumer(), KafkaProducerTemplate()),
+        "aks": AKSTopo("aks", MockConsumer(), KafkaProducerTemplate()),
+        "do":  DOTopo("do",  MockConsumer(), KafkaProducerTemplate()),
     }
 
-    print("\n=== Multi-Agent Simulation ===\n")
+    print("\n=== Multi-Agent Simulation (Kafka Producer Mode) ===\n")
 
     for iteration in range(5):
         print(f"\n--- Iteration {iteration + 1} ---")
@@ -86,24 +74,41 @@ def main():
                 agent_msg = convert_to_agent_message(sim_msg)
                 agent.process_message("metrics.events", agent_msg)
 
-        # Trigger computation for ALL agents
+        # Trigger computation + publish
+        print("\n[Agent Decisions → Kafka]")
         for name, agent in agents.items():
-            agent._compute_and_publish()
-
-        # Print outputs per agent
-        print("\n[Agent Decisions]")
-        for name, agent in agents.items():
-            producer = agent.producer
-
             print(f"\nAgent: {name}")
-            for topic, decision in producer.sent_events:
-                payload = json.loads(decision.value.decision)
-                print(json.dumps(payload, indent=2))
 
-            # clear for next iteration
-            producer.sent_events.clear()
+            # Compute actions manually so we can print them
+            actions = agent._compute_redistribution_actions()
+
+            if not actions:
+                print("No actions")
+                continue
+
+            # Pretty print actions
+            payload = {
+                "actions": [
+                    {
+                        "from": a["from"],
+                        "to": a["to"],
+                        "intensity": a["intensity"],
+                    }
+                    for a in actions
+                ]
+            }
+
+            print(json.dumps(payload, indent=2))
+
+            # Now publish to Kafka
+            agent._publish_actions(actions)
 
         time.sleep(1)
+
+    # Ensure all messages are flushed before exit
+    print("\nFlushing producers...")
+    for agent in agents.values():
+        agent.producer.close()
 
     print("\n=== Done ===")
 

@@ -38,11 +38,13 @@ import time
 import json
 from typing import Dict, List, Optional
 from datetime import datetime
-
+import config
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
-from kafka_core.schemas import PolicyDecision, PolicyDecisionValue
+from kafka_core.schemas import TopoDecision, TopoDecisionValue
 from kafka_core.enums import PolicyStatus, RiskLevel
+from kafka_core.schemas import TopoAction
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -247,7 +249,7 @@ class TopographyAgent(KafkaConsumerTemplate):
 
     def __init__(
         self,
-        service_id: str = "aws",
+        service_id: str = "do",
         consumer: Optional[KafkaConsumerTemplate] = None,
         producer: Optional[KafkaProducerTemplate] = None,
     ):
@@ -356,27 +358,34 @@ class TopographyAgent(KafkaConsumerTemplate):
     def _publish_actions(self, actions: List[Dict]):
         decision_id = f"topo-{self.service_id}-{int(time.time())}"
 
-        decision_value = PolicyDecisionValue(
-            service    = self.service_id,
-            decision   = json.dumps({"actions": actions}),
-            risk_level = self._assess_risk(actions),
-            status     = PolicyStatus.PENDING,
-            timestamp  = datetime.now(),
-            metadata   = {
-                "agent_type":        "topography",
-                "solver":            "convex_qp_entropy_regularised",
-                "iteration":         self.iteration_count,
-                "global_state_size": len(self.global_state),
-                "temperature":       self.temperature * ((1 - self.gamma) ** self.iteration_count),
-                "alpha":             self.alpha,
-                "beta":              self.beta,
-                "gamma":             self.gamma,
-            },
-        )
+        decision_value = TopoDecisionValue(
+                service=self.service_id,
+                actions=[
+                    TopoAction(
+                        source=a["from"],
+                        target=a["to"],
+                        intensity=a["intensity"],
+                    )
+                    for a in actions
+                ],
+                risk_level=self._assess_risk(actions),
+                status=PolicyStatus.PENDING,
+                timestamp=datetime.now(),
+                metadata={
+                    "agent_type": "topography",
+                    "solver": "convex_qp_entropy_regularised",
+                    "iteration": self.iteration_count,
+                    "global_state_size": len(self.global_state),
+                    "temperature": self.temperature * ((1 - self.gamma) ** self.iteration_count),
+                    "alpha": self.alpha,
+                    "beta": self.beta,
+                    "gamma": self.gamma,
+                },
+            )
 
         success = self.producer.send(
-            "policy.decisions",
-            PolicyDecision(key=decision_id, value=decision_value)
+            "topo.decisions",
+            TopoDecision(key=decision_id, value=decision_value)
         )
 
         if success:

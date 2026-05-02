@@ -54,7 +54,7 @@ DEPENDENCIES:
 
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 try:
@@ -167,3 +167,48 @@ class PolicyExecution(BaseModel):
     """Complete policy execution with key and value."""
     key: str = Field(..., description="Partition key (execution_id)")
     value: PolicyExecutionValue
+
+# ============================================================
+# Topology Decisions Topic Schema
+# ============================================================
+
+class TopoAction(BaseModel):
+    """Single redistribution action."""
+    source: str = Field(..., description="Overloaded service (from)")
+    target: str = Field(..., description="Underloaded service (to)")
+    intensity: float = Field(..., ge=0.0, description="Flow intensity (0 → 1)")
+
+    class Config:
+        use_enum_values = False
+
+
+class TopoDecisionValue(BaseModel):
+    """Value schema for topo.decisions topic."""
+    service: str = Field(..., description="Agent/service emitting decision")
+    actions: List[TopoAction] = Field(
+        ..., description="List of redistribution actions"
+    )
+    risk_level: RiskLevel = Field(..., description="Risk classification")
+    status: PolicyStatus = Field(..., description="Decision status")
+    timestamp: datetime = Field(..., description="Event timestamp")
+
+    # Observability / traceability
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Solver metadata, parameters, diagnostics"
+    )
+    correlation_id: Optional[str] = Field(
+        None, description="Trace correlation ID"
+    )
+    parent_event_id: Optional[str] = Field(
+        None, description="Upstream event reference"
+    )
+
+    class Config:
+        use_enum_values = False
+
+
+class TopoDecision(BaseModel):
+    """Complete topology decision event."""
+    key: str = Field(..., description="Partition key (topo_decision_id)")
+    value: TopoDecisionValue

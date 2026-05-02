@@ -352,7 +352,7 @@ class PrometheusMetricsAdapter:
                 
                 # Send to Kafka
                 try:
-                    record_meta = self.producer.send("metrics.events", event,key=partition_key)
+                    record_meta = self.producer.send(topic="metrics.events",value=event,key=partition_key)
                     logger.info(f"Sent metrics for {endpoint_name} to Kafka: {record_meta}")
                 except Exception as e:
                     logger.error(f"Failed to send {endpoint_name} metrics to Kafka: {e}")
