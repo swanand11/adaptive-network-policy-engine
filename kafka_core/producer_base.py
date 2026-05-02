@@ -71,9 +71,20 @@ from typing import Any
 from datetime import datetime
 from json import JSONEncoder
 
-from kafka import KafkaProducer
-from kafka.errors import KafkaError
-from pydantic import BaseModel
+try:
+    from kafka import KafkaProducer
+    from kafka.errors import KafkaError
+except ImportError:  # pragma: no cover
+    KafkaProducer = None
+
+    class KafkaError(Exception):
+        pass
+
+try:
+    from pydantic import BaseModel
+except ImportError:  # pragma: no cover
+    class BaseModel:
+        pass
 
 from .config import KafkaConfig
 from .exceptions import KafkaProducerError
@@ -107,6 +118,9 @@ class KafkaProducerTemplate:
 
     def _initialize_producer(self) -> None:
         """Initialize the underlying Kafka producer."""
+        if KafkaProducer is None:
+            raise KafkaProducerError("kafka package is not installed")
+
         try:
             config = KafkaConfig.get_producer_config()
             self.producer = KafkaProducer(

@@ -124,6 +124,9 @@ class KafkaConsumerTemplate(ABC):
 
     def _initialize_consumer(self) -> None:
         """Initialize the underlying Kafka consumer."""
+        if KafkaConsumer is None:
+            raise KafkaConsumerError("kafka package is not installed")
+
         try:
             config = KafkaConfig.get_consumer_config(self.group_id)
             self.consumer = KafkaConsumer(

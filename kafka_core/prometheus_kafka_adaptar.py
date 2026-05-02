@@ -82,7 +82,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
+'''Prometheus send data in text/plain so this parser reads text and extracts the relavent metrics '''
 class PrometheusParser:
     """Parse Prometheus text format (OpenMetrics)."""
     
