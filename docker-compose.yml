@@ -24,13 +24,14 @@ services:
       - zookeeper
     ports:
       - "9092:9092"
+      - "29092:29092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
@@ -135,7 +136,7 @@ services:
       PROMETHEUS_DO_URL: "http://digitalocean-simulator:8003/metrics"
       
       # Kafka configuration (internal Docker network)
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       
       # Logging
       LOG_LEVEL: "INFO"
@@ -169,7 +170,7 @@ services:
     container_name: service-agent
     command: python runners/service_agent_runner.py
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       SERVICE_ID: "service-cache-aws"
       LOG_LEVEL: "INFO"
       PYTHONUNBUFFERED: "1"
@@ -186,7 +187,7 @@ services:
     container_name: service-agent-2
     command: python runners/service_agent_runner.py
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       SERVICE_ID: "service-db"
       LOG_LEVEL: "INFO"
       PYTHONUNBUFFERED: "1"
@@ -203,7 +204,7 @@ services:
     container_name: service-agent-3
     command: python runners/service_agent_runner.py
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       SERVICE_ID: "service-cache"
       LOG_LEVEL: "INFO"
       PYTHONUNBUFFERED: "1"

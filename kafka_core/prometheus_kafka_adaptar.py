@@ -319,8 +319,8 @@ class PrometheusMetricsAdapter:
                 normalized = self.normalizer.normalize(parsed_metrics)
                 logger.debug(f"Normalized metrics for {endpoint_name}: {normalized}")
                 
-                # Use service_id as key, but explicitly route to assigned partition for balanced distribution
-                partition_key = config['service_id']
+                # Use service_id@cloud as key for partition routing and agent identification
+                partition_key = f"{config['service_id']}@{config['cloud'].value}"
                 target_partition = config['partition']
                 event = MetricsEvent(
                     key=partition_key,

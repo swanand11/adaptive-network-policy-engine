@@ -2,6 +2,8 @@
 #
 # Specifies which (service_id, cloud) pairs to monitor.
 # Each agent instance processes its own metrics independently.
+# The parallel runner extracts service_id+cloud from the Kafka message key
+# and lazily creates one ServiceAgent per unique (service_id, cloud) pair.
 
 group_id: "service_agent_parallel"
 
@@ -16,9 +18,11 @@ queue_config:
   timeout_seconds: 30
 
 # Agents to instantiate
-# Each agent monitors metrics for a specific (service_id, cloud) pair
+# Must match the service_id values produced by the Prometheus adapter
+# and used in the mock simulators.
 agents:
-  - service_id: "service-api"
+  # AWS simulator → service-cache-aws@aws (partition 0)
+  - service_id: "service-cache-aws"
     cloud: "aws"
     alpha: 0.3
     latency_threshold: 200.0
@@ -26,26 +30,20 @@ agents:
     cpu_threshold: 0.8
     window_size: 5
 
-  - service_id: "service-api"
-    cloud: "gcp"
-    alpha: 0.3
-    latency_threshold: 200.0
-    error_threshold: 0.05
-    cpu_threshold: 0.8
-    window_size: 5
-
-  - service_id: "service-cache"
-    cloud: "aws"
-    alpha: 0.25
-    latency_threshold: 100.0
-    error_threshold: 0.02
-    cpu_threshold: 0.85
-    window_size: 5
-
-  - service_id: "service-cache"
+  # AKS simulator → service-db@azure (partition 1)
+  - service_id: "service-db"
     cloud: "azure"
+    alpha: 0.3
+    latency_threshold: 200.0
+    error_threshold: 0.05
+    cpu_threshold: 0.8
+    window_size: 5
+
+  # DigitalOcean simulator → service-cache@digitalocean (partition 2)
+  - service_id: "service-cache"
+    cloud: "digitalocean"
     alpha: 0.25
-    latency_threshold: 100.0
-    error_threshold: 0.02
+    latency_threshold: 150.0
+    error_threshold: 0.03
     cpu_threshold: 0.85
     window_size: 5

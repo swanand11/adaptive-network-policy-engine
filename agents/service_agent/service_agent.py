@@ -79,6 +79,14 @@ class ServiceAgent(KafkaConsumerTemplate):
             return 0.0
         return self.latency_window[-1] - self.latency_window[-2]
 
+    def classify_status(self, latency: float, error_rate: Optional[float], cpu: Optional[float]) -> str:
+        """Classify service health status based on thresholds."""
+        if latency > self.latency_threshold * 1.5 or (error_rate and error_rate > self.error_threshold * 2):
+            return "overloaded"
+        if latency > self.latency_threshold or (error_rate and error_rate > self.error_threshold) or (cpu and cpu > self.cpu_threshold):
+            return "stressed"
+        return "healthy"
+
     def compute_confidence(self) -> float:
         if len(self.latency_window) < 2:
             return 0.5
@@ -120,11 +128,13 @@ class ServiceAgent(KafkaConsumerTemplate):
         self.update_window(current_latency, current_error)
         trend_value = self.compute_trend()
         confidence = self.compute_confidence()
+        status = self.classify_status(ewma, current_error, current_cpu)
 
         return {
             "latency_ewma": round(ewma, 2),
             "trend": f"{'+ ' if trend_value >= 0 else ''}{round(trend_value, 2)}ms".replace('+ ', '+'),
             "confidence": confidence,
+            "status": status,
         }
 
     def build_intent(

@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, Optional
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, ConsumerRebalanceListener
 from kafka.errors import KafkaError
 
 from agents.agent_registry import AgentRegistry
@@ -40,7 +40,7 @@ from kafka_core.topic_initializer import TopicInitializer
 logger = logging.getLogger(__name__)
 
 
-class ParallelServiceAgentRunner:
+class ParallelServiceAgentRunner(ConsumerRebalanceListener):
     """
     Manages parallel partition processing with configuration-driven agent instantiation.
 
@@ -105,8 +105,7 @@ class ParallelServiceAgentRunner:
             # Set rebalance listener for partition assignment/revocation
             self.consumer.subscribe(
                 ["metrics.events"],
-                on_partitions_revoked=self._on_partitions_revoked,
-                on_partitions_assigned=self._on_partitions_assigned,
+                listener=self
             )
 
             logger.info(f"Consumer initialized for group {self.group_id}")
@@ -115,7 +114,7 @@ class ParallelServiceAgentRunner:
             logger.error(f"Failed to initialize consumer: {e}")
             raise
 
-    def _on_partitions_revoked(self, partitions: Any) -> None:
+    def on_partitions_revoked(self, partitions: Any) -> None:
         """
         Callback when partitions are revoked during rebalancing.
 
@@ -131,7 +130,7 @@ class ParallelServiceAgentRunner:
         for partition_id in revoked_partition_ids:
             self._stop_worker(partition_id)
 
-    def _on_partitions_assigned(self, partitions: Any) -> None:
+    def on_partitions_assigned(self, partitions: Any) -> None:
         """
         Callback when new partitions are assigned during rebalancing.
 
@@ -172,6 +171,7 @@ class ParallelServiceAgentRunner:
                 producer_registry=self.producer_registry,
                 group_id=self.group_id,
                 manual_commit_fn=self._make_commit_fn(),
+                runner_config=self.config,
                 logger_name=f"PartitionWorker[{partition_id}]",
                 queue_timeout_seconds=self.config["queue_config"]["timeout_seconds"],
             )

@@ -39,6 +39,7 @@ class PartitionWorker:
         producer_registry: Any,
         group_id: str,
         manual_commit_fn: Callable,
+        runner_config: dict,
         logger_name: Optional[str] = None,
         queue_timeout_seconds: float = 30.0,
     ):
@@ -61,6 +62,7 @@ class PartitionWorker:
         self.producer_registry = producer_registry
         self.group_id = group_id
         self.manual_commit_fn = manual_commit_fn
+        self.runner_config = runner_config
         self.queue_timeout_seconds = queue_timeout_seconds
 
         logger_name = logger_name or f"PartitionWorker[{partition_id}]"
@@ -231,16 +233,23 @@ class PartitionWorker:
         # Get cloud-specific producer from registry
         cloud_producer = self.producer_registry.get_or_create_producer(cloud)
 
-        # Create ServiceAgent with cloud-specific producer
+        # Lookup specific config for this agent from runner_config
+        agent_config = {}
+        if "agents" in self.runner_config:
+            for a in self.runner_config["agents"]:
+                if a.get("service_id") == service_id and a.get("cloud") == cloud:
+                    agent_config = a
+                    break
+
+        # Create ServiceAgent with cloud-specific producer and config-driven thresholds
         agent = ServiceAgent(
             service_id=service_id,
             cloud=cloud,
-            cloud_producer=cloud_producer,  # NEW: pass cloud-specific producer
-            # Use default alpha, thresholds, etc.
-            alpha=0.3,
-            latency_threshold=200.0,
-            error_threshold=0.05,
-            cpu_threshold=0.8,
-            window_size=5,
+            cloud_producer=cloud_producer,
+            alpha=agent_config.get("alpha", 0.3),
+            latency_threshold=agent_config.get("latency_threshold", 200.0),
+            error_threshold=agent_config.get("error_threshold", 0.05),
+            cpu_threshold=agent_config.get("cpu_threshold", 0.8),
+            window_size=agent_config.get("window_size", 5),
         )
         return agent
