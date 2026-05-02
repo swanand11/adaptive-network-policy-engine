@@ -83,7 +83,8 @@ import logging
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, TopicPartition
+from kafka.structs import OffsetAndMetadata
 from kafka.errors import KafkaError
 
 from .config import KafkaConfig
@@ -220,6 +221,32 @@ class KafkaConsumerTemplate(ABC):
         """
         for msg in messages:
             self.process_message(topic=msg["topic"], message=msg["value"])
+
+    def manual_commit(self, topic: str, partition: int, offset: int) -> None:
+        """
+        Manually commit offset for a specific partition.
+        
+        Used by partition workers to commit offsets only after successful processing.
+        
+        Args:
+            topic: Topic name
+            partition: Partition number
+            offset: Offset to commit (will commit offset + 1, following Kafka convention)
+            
+        Raises:
+            KafkaConsumerError: If commit fails
+        """
+        if not self.consumer:
+            raise KafkaConsumerError("Consumer not initialized")
+
+        try:
+            topic_partition = TopicPartition(topic, partition)
+            offset_metadata = OffsetAndMetadata(offset + 1)
+            self.consumer.commit({topic_partition: offset_metadata})
+            logger.debug(f"Committed offset {offset} for {topic}[{partition}]")
+        except KafkaError as e:
+            logger.error(f"Failed to commit offset {offset} for {topic}[{partition}]: {e}")
+            raise KafkaConsumerError(f"Offset commit failed: {e}")
 
     def close(self) -> None:
         """Close the consumer."""

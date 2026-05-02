@@ -1,0 +1,51 @@
+# Service Agent Configuration
+#
+# Specifies which (service_id, cloud) pairs to monitor.
+# Each agent instance processes its own metrics independently.
+
+group_id: "service_agent_parallel"
+
+# Consumer configuration
+consumer_config:
+  session_timeout_ms: 30000
+  heartbeat_interval_ms: 10000
+
+# Queue configuration for partition workers
+queue_config:
+  max_size: 1000
+  timeout_seconds: 30
+
+# Agents to instantiate
+# Each agent monitors metrics for a specific (service_id, cloud) pair
+agents:
+  - service_id: "service-api"
+    cloud: "aws"
+    alpha: 0.3
+    latency_threshold: 200.0
+    error_threshold: 0.05
+    cpu_threshold: 0.8
+    window_size: 5
+
+  - service_id: "service-api"
+    cloud: "gcp"
+    alpha: 0.3
+    latency_threshold: 200.0
+    error_threshold: 0.05
+    cpu_threshold: 0.8
+    window_size: 5
+
+  - service_id: "service-cache"
+    cloud: "aws"
+    alpha: 0.25
+    latency_threshold: 100.0
+    error_threshold: 0.02
+    cpu_threshold: 0.85
+    window_size: 5
+
+  - service_id: "service-cache"
+    cloud: "azure"
+    alpha: 0.25
+    latency_threshold: 100.0
+    error_threshold: 0.02
+    cpu_threshold: 0.85
+    window_size: 5

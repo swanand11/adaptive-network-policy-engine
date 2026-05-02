@@ -18,11 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 class ServiceAgent(KafkaConsumerTemplate):
-    """Service Agent consumes metrics.events and produces service.state events."""
+    """
+    Service Agent consumes metrics.events and produces service.state events.
+    
+    One instance per (service_id, cloud) pair for isolation and independent metrics tracking.
+    """
 
     def __init__(
         self,
         service_id: str,
+        cloud: Optional[str] = None,
+        cloud_producer: Optional[object] = None,
         alpha: float = 0.3,
         latency_threshold: float = 200.0,
         error_threshold: float = 0.05,
@@ -32,6 +38,7 @@ class ServiceAgent(KafkaConsumerTemplate):
     ):
         super().__init__(topics=["metrics.events"], group_id=group_id)
         self.service_id = service_id
+        self.cloud = cloud  # Cloud provider for this agent instance
         self.alpha = alpha
         self.latency_threshold = latency_threshold
         self.error_threshold = error_threshold
@@ -40,7 +47,12 @@ class ServiceAgent(KafkaConsumerTemplate):
         self.latency_window: list[float] = []
         self.error_window: list[float] = []
         self.window_size = window_size
-        self.producer = KafkaProducerTemplate()
+        
+        # Use provided cloud-specific producer, or fallback to creating own (for backward compatibility)
+        if cloud_producer is not None:
+            self.producer = cloud_producer
+        else:
+            self.producer = KafkaProducerTemplate()
 
     def update_ewma(self, current_latency: float) -> float:
         if self.ewma_latency is None:
