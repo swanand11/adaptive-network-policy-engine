@@ -56,7 +56,24 @@ DEPENDENCIES:
 
 from typing import Any, Dict, Optional
 from datetime import datetime
-from pydantic import BaseModel, Field
+
+try:
+    from pydantic import BaseModel, Field
+except ImportError:  # pragma: no cover
+    class BaseModel:
+        def __init__(self, **data):
+            for key, value in data.items():
+                setattr(self, key, value)
+
+        def dict(self):
+            result = {}
+            for key, value in self.__dict__.items():
+                result[key] = value.dict() if hasattr(value, "dict") else value
+            return result
+
+    def Field(default=None, **kwargs):
+        return default
+
 from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
 
 

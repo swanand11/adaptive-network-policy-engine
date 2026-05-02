@@ -11,7 +11,7 @@
   - Consumes normalized load signals
   - Computes pressure (`P_i = L_opt_i - L_i`)
   - Identifies overloaded and underloaded services
-  - Generates redistribution actions
+  - Generates redistribution actions (using convex solver which uses complex math above our paygrade )
 - Designed for distributed, event-driven execution
 
 ## 🧪 Pipeline Runner

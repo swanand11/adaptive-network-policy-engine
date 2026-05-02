@@ -83,8 +83,14 @@ import logging
 from typing import List, Dict, Any
 from abc import ABC, abstractmethod
 
-from kafka import KafkaConsumer
-from kafka.errors import KafkaError
+try:
+    from kafka import KafkaConsumer
+    from kafka.errors import KafkaError
+except ImportError:  # pragma: no cover
+    KafkaConsumer = None
+
+    class KafkaError(Exception):
+        pass
 
 from .config import KafkaConfig
 from .exceptions import KafkaConsumerError
@@ -123,6 +129,9 @@ class KafkaConsumerTemplate(ABC):
 
     def _initialize_consumer(self) -> None:
         """Initialize the underlying Kafka consumer."""
+        if KafkaConsumer is None:
+            raise KafkaConsumerError("kafka package is not installed")
+
         try:
             config = KafkaConfig.get_consumer_config(self.group_id)
             self.consumer = KafkaConsumer(

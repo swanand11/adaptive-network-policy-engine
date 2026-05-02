@@ -234,7 +234,13 @@ NEXT STEPS:
 
 from .producer_base import KafkaProducerTemplate
 from .consumer_base import KafkaConsumerTemplate
-from .topic_initializer import TopicInitializer, initialize_kafka_topics
+
+try:
+    from .topic_initializer import TopicInitializer, initialize_kafka_topics
+except ImportError:  # pragma: no cover
+    TopicInitializer = None
+    initialize_kafka_topics = None
+
 from .config import KafkaConfig
 from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
 from .schemas import (

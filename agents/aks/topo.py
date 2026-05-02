@@ -7,8 +7,23 @@ Core Logic:
 1. Consume global state of normalized loads from all services
 2. Compute pressure per service: P_i = L_opt_i - L_i
 3. Partition into overloaded (P_i < 0) and underloaded (P_i > 0) sets
-4. Compute redistribution flows between overloaded and underloaded services
-5. Produce action signals for traffic redistribution
+4. Solve convex QP to find optimal redistribution flows f_ij
+5. Produce action signals: {from, to, intensity}
+
+Optimization Problem:
+---------------------
+Variables : f_ij >= 0  for i ∈ Overloaded, j ∈ Underloaded
+
+Objective :
+  min_f   Σ_i (P_i + Σ_j f_ij)²          ← overloaded residuals (want outflow = |P_i|)
+        + Σ_j (P_j - Σ_i f_ij)²          ← underloaded residuals (want inflow = P_j)
+        + β · Σ_ij f_ij²                  ← Tikhonov: penalise large flows
+        - T · Σ_ij H(f_ij)               ← entropy barrier: smooth/unique solution
+
+Constraints (projected after each gradient step):
+  Σ_j f_ij  ≤  α · |P_i|    ∀ i ∈ Overloaded
+  Σ_i f_ij  ≤  α · P_j      ∀ j ∈ Underloaded
+  f_ij      ≥  0
 
 Architecture:
 - No direct inter-agent communication
@@ -18,11 +33,12 @@ Architecture:
 """
 
 import logging
+import math
 import time
-from typing import Dict, List, Tuple, Optional
-from collections import defaultdict
-from datetime import datetime
 import json
+from typing import Dict, List, Optional
+from datetime import datetime
+import config
 
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
@@ -32,26 +48,211 @@ from kafka_core.enums import PolicyStatus, RiskLevel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_ENTROPY_EPS = 1e-9
+_FLOW_THRESH = 1e-3
 
-class TopographyAgent(KafkaConsumerTemplate):
-    """Topography Agent that computes load redistribution actions."""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _zeros(n: int, m: int) -> List[List[float]]:
+    return [[0.0] * m for _ in range(n)]
+
+
+def _clip(x: float, lo: float = 0.0, hi: float = float("inf")) -> float:
+    return max(lo, min(hi, x))
+
+
+# ---------------------------------------------------------------------------
+# Convex QP solver — projected gradient + Armijo line search
+# ---------------------------------------------------------------------------
+
+class ConvexFlowSolver:
+    """
+    Solves the load-redistribution QP in a single call.
+
+    Objective:
+        F(f) = Σ_i (P_i + Σ_j f_ij)²        overloaded residuals
+             + Σ_j (P_j - Σ_i f_ij)²        underloaded residuals
+             + β · Σ_ij f_ij²               Tikhonov regularisation
+             + T · Σ_ij f_ij·ln(f_ij + ε)  entropy barrier  (−T·H, strictly convex)
+
+    Constraints (Dykstra projection):
+        Σ_j f_ij  ≤  α · |P_i|   row capacity
+        Σ_i f_ij  ≤  α ·  P_j   col capacity
+        f_ij      ≥  0
+    """
 
     def __init__(
         self,
-        service_id: str = "aws",
+        alpha: float,
+        beta: float,
+        temperature: float,
+        max_iters: int = 300,
+        tol: float = 1e-6,
+        armijo_c: float = 1e-4,
+        armijo_rho: float = 0.5,
+    ):
+        self.alpha       = alpha
+        self.beta        = beta
+        self.temperature = temperature
+        self.max_iters   = max_iters
+        self.tol         = tol
+        self.armijo_c    = armijo_c
+        self.armijo_rho  = armijo_rho
+
+    def solve(
+        self,
+        overloaded:  List[str],
+        underloaded: List[str],
+        pressures:   Dict[str, float],
+        confidences: Dict[str, float],
+    ) -> List[Dict]:
+        """
+        Returns optimal flows as action list: [{from, to, intensity}, ...]
+        """
+        n_o = len(overloaded)
+        n_u = len(underloaded)
+
+        cap_row = [self.alpha * abs(pressures[s]) for s in overloaded]
+        cap_col = [self.alpha * pressures[s]      for s in underloaded]
+
+        # Warm start: confidence-weighted proportional allocation (greedy heuristic)
+        f = _zeros(n_o, n_u)
+        for i, s_i in enumerate(overloaded):
+            for j, s_j in enumerate(underloaded):
+                f[i][j] = confidences.get(s_i, 1.0) * confidences.get(s_j, 1.0)
+        f = self._project(f, cap_row, cap_col)
+
+        # Projected gradient descent with Armijo line search
+        prev_obj = float("inf")
+        for iteration in range(self.max_iters):
+            obj  = self._objective(f, overloaded, underloaded, pressures, n_o, n_u)
+            grad = self._gradient(f, overloaded, underloaded, pressures, n_o, n_u)
+
+            step = 1.0
+            for _ in range(50):
+                f_new = self._project(
+                    [[_clip(f[i][j] - step * grad[i][j]) for j in range(n_u)]
+                     for i in range(n_o)],
+                    cap_row, cap_col
+                )
+                obj_new  = self._objective(f_new, overloaded, underloaded, pressures, n_o, n_u)
+                grad_dot = sum(
+                    grad[i][j] * (f_new[i][j] - f[i][j])
+                    for i in range(n_o) for j in range(n_u)
+                )
+                if obj_new <= obj + self.armijo_c * grad_dot:
+                    break
+                step *= self.armijo_rho
+
+            f = f_new
+
+            if abs(prev_obj - obj_new) < self.tol:
+                logger.debug(f"Solver converged at iteration {iteration}")
+                break
+            prev_obj = obj_new
+
+        # Emit result
+        actions = [
+            {"from": overloaded[i], "to": underloaded[j], "intensity": round(f[i][j], 4)}
+            for i in range(n_o)
+            for j in range(n_u)
+            if f[i][j] > _FLOW_THRESH
+        ]
+        actions.sort(key=lambda a: a["intensity"], reverse=True)
+        return actions
+
+    # ------------------------------------------------------------------
+    # Objective  F(f)
+    # ------------------------------------------------------------------
+
+    def _objective(self, f, overloaded, underloaded, pressures, n_o, n_u) -> float:
+        residual = 0.0
+        for i in range(n_o):
+            residual += (pressures[overloaded[i]] + sum(f[i])) ** 2
+        for j in range(n_u):
+            absorbed = sum(f[i][j] for i in range(n_o))
+            residual += (pressures[underloaded[j]] - absorbed) ** 2
+
+        tikhonov = sum(f[i][j] ** 2      for i in range(n_o) for j in range(n_u))
+        entropy  = sum(
+            f[i][j] * math.log(f[i][j] + _ENTROPY_EPS)
+            for i in range(n_o) for j in range(n_u)
+        )
+        return residual + self.beta * tikhonov + self.temperature * entropy
+
+    # ------------------------------------------------------------------
+    # Gradient  ∂F/∂f_ij
+    # ------------------------------------------------------------------
+
+    def _gradient(self, f, overloaded, underloaded, pressures, n_o, n_u) -> List[List[float]]:
+        res_o = [pressures[overloaded[i]] + sum(f[i])                          for i in range(n_o)]
+        res_u = [pressures[underloaded[j]] - sum(f[i][j] for i in range(n_o)) for j in range(n_u)]
+
+        grad = _zeros(n_o, n_u)
+        for i in range(n_o):
+            for j in range(n_u):
+                v = f[i][j]
+                grad[i][j] = (
+                    2.0 * res_o[i]                                            # ∂ overloaded residual²
+                    - 2.0 * res_u[j]                                          # ∂ underloaded residual²
+                    + 2.0 * self.beta * v                                     # ∂ Tikhonov
+                    + self.temperature * (math.log(v + _ENTROPY_EPS) + 1.0)  # ∂ entropy barrier
+                )
+        return grad
+
+    # ------------------------------------------------------------------
+    # Dykstra projection onto {f≥0, row sums ≤ cap_row, col sums ≤ cap_col}
+    # ------------------------------------------------------------------
+
+    def _project(self, f, cap_row, cap_col, iters: int = 30) -> List[List[float]]:
+        n_o = len(cap_row)
+        n_u = len(cap_col)
+        f   = [[_clip(f[i][j]) for j in range(n_u)] for i in range(n_o)]
+
+        p = _zeros(n_o, n_u)  # Dykstra increments — row constraints
+        q = _zeros(n_o, n_u)  # Dykstra increments — col constraints
+
+        for _ in range(iters):
+            prev = [row[:] for row in f]
+            for i in range(n_o):
+                y = [_clip(f[i][j] + p[i][j]) for j in range(n_u)]
+                s = sum(y)
+                if s > cap_row[i] > 0:
+                    y = [v * cap_row[i] / s for v in y]
+                for j in range(n_u):
+                    p[i][j] = prev[i][j] + p[i][j] - y[j]
+                    f[i][j] = _clip(y[j])
+
+            prev = [row[:] for row in f]
+            for j in range(n_u):
+                y = [_clip(f[i][j] + q[i][j]) for i in range(n_o)]
+                s = sum(y)
+                if s > cap_col[j] > 0:
+                    y = [v * cap_col[j] / s for v in y]
+                for i in range(n_o):
+                    q[i][j] = prev[i][j] + q[i][j] - y[i]
+                    f[i][j] = _clip(y[i])
+
+        return f
+
+
+# ---------------------------------------------------------------------------
+# TopographyAgent
+# ---------------------------------------------------------------------------
+
+class TopographyAgent(KafkaConsumerTemplate):
+    """Topography Agent — computes load redistribution flows via convex QP."""
+
+    def __init__(
+        self,
+        service_id: str = "aks",
         consumer: Optional[KafkaConsumerTemplate] = None,
         producer: Optional[KafkaProducerTemplate] = None,
     ):
-        """
-        Initialize the Topography Agent.
-
-        Args:
-            service_id: Identifier for this service instance
-            consumer: Injected Kafka consumer (for testing)
-            producer: Injected Kafka producer (for testing)
-        """
         if consumer:
-            # Don't call super().__init__ if using mock
             self.consumer = consumer
         else:
             super().__init__(
@@ -60,343 +261,155 @@ class TopographyAgent(KafkaConsumerTemplate):
             )
 
         self.service_id = service_id
+        self.producer   = producer or KafkaProducerTemplate()
 
-
-        self.producer = producer or KafkaProducerTemplate()
-
-        # Global state
+        # Global state: service_id → {L_i, L_opt_i, confidence}
         self.global_state: Dict[str, Dict] = {}
 
-        # Parameters
-        self.alpha = 0.4
-        self.beta = 0.2
-        self.temperature = 1.5
-        self.gamma = 0.08
+        # Hyper-parameters
+        self.alpha       = 0.4   # fraction of |pressure| available for redistribution
+        self.beta        = 0.2   # Tikhonov weight (penalises large individual flows)
+        self.temperature = 1.5    # entropy barrier scale (anneals across decisions)
+        self.gamma       = 0.08   # temperature decay rate per published decision
 
-        # Processing state
-        self.iteration_count = 0
-        self.last_computation_time = 0
-        self.computation_interval = 5.0
+        self.iteration_count       = 0
+        self.last_computation_time = 0.0
+        self.computation_interval  = 5.0
 
-        logger.info(f"Topography Agent initialized for service {service_id}")
+        logger.info(f"Topography Agent initialised for service {service_id}")
+
+    # ------------------------------------------------------------------
+    # Kafka ingestion
+    # ------------------------------------------------------------------
 
     def process_message(self, topic: str, message: dict) -> bool:
-        """
-        Process incoming normalized load message.
-
-        Expected message format from mock:
-        MetricsEvent with metrics containing:
-        {
-            "L_i": 0.6,
-            "L_opt_i": 0.4,
-            "confidence": 0.82
-        }
-        """
         try:
-            # Extract service_id from the message
-            # For MetricsEvent, service_id is in value.service
             if "value" in message and "service" in message["value"]:
                 service_id = message["value"]["service"]
-                metrics = message["value"].get("metrics", {})
+                metrics    = message["value"].get("metrics", {})
 
-                # Check if this message contains normalized load data
                 if "L_i" in metrics and "L_opt_i" in metrics:
-                    # Update global state
                     self.global_state[service_id] = {
-                        "L_i": metrics.get("L_i", 0.0),
-                        "L_opt_i": metrics.get("L_opt_i", 0.0),
-                        "confidence": metrics.get("confidence", 0.0)
+                        "L_i":        metrics.get("L_i",        0.0),
+                        "L_opt_i":    metrics.get("L_opt_i",    0.0),
+                        "confidence": metrics.get("confidence", 0.0),
                     }
-
                     logger.debug(f"Updated state for {service_id}: {self.global_state[service_id]}")
 
-                    # Check if we should compute actions
                     current_time = time.time()
                     if current_time - self.last_computation_time >= self.computation_interval:
-                        self.compute_and_publish_actions()
+                        self._compute_and_publish()
                         self.last_computation_time = current_time
-                        self.iteration_count += 1
+                return True
 
-                    return True
-                else:
-                    # Not a normalized load message, skip
-                    return True
-            else:
-                logger.warning(f"Invalid message format: {message}")
-                return False
+            logger.warning(f"Invalid message format: {message}")
+            return False
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
             return False
 
-    def compute_and_publish_actions(self):
-        """Compute redistribution actions and publish them."""
+    # ------------------------------------------------------------------
+    # Compute → publish
+    # ------------------------------------------------------------------
+
+    def _compute_and_publish(self):
         if len(self.global_state) < 2:
-            logger.info("Not enough services in global state for redistribution")
+            logger.info("Not enough services for redistribution")
             return
-
         try:
-            actions = self.compute_redistribution_actions()
-
+            actions = self._compute_redistribution_actions()
             if actions:
-                self.publish_actions(actions)
-                logger.info(f"Published {len(actions)} redistribution actions")
+                self._publish_actions(actions)
             else:
                 logger.info("No redistribution actions needed")
-
         except Exception as e:
             logger.error(f"Error computing actions: {e}")
 
-    def compute_redistribution_actions(self) -> List[Dict]:
+    def _compute_redistribution_actions(self) -> List[Dict]:
         """
-        Compute redistribution actions based on current global state.
-
-        Returns:
-            List of action dictionaries: [{"from": str, "to": str, "intensity": float}, ...]
+        1. Compute pressures  P_i = L_opt_i - L_i
+        2. Partition overloaded (P<0) / underloaded (P≥0)
+        3. Solve convex QP → [{from, to, intensity}, ...]
         """
-        if not self.global_state:
-            return []
+        pressures   = {s: st["L_opt_i"] - st["L_i"] for s, st in self.global_state.items()}
+        overloaded  = [s for s, p in pressures.items() if p <  0]
+        underloaded = [s for s, p in pressures.items() if p >= 0]
 
-        # Step 1: Compute pressure per service
-        pressures = self.compute_pressures()
-
-        # Step 2: Partition nodes
-        overloaded, underloaded = self.partition_nodes(pressures)
+        logger.info(f"Overloaded: {overloaded}  Underloaded: {underloaded}")
 
         if not overloaded or not underloaded:
-            logger.info("No overloaded or underloaded services found")
             return []
 
-        # Step 3: Compute redistribution flows
-        actions = self.compute_flows(overloaded, underloaded, pressures)
+        confidences  = {s: self.global_state[s]["confidence"] for s in self.global_state}
+        current_temp = self.temperature * ((1 - self.gamma) ** self.iteration_count)
 
-        # Step 4: Apply iterative refinement (optional)
-        # self.apply_iterative_refinement()
+        return ConvexFlowSolver(
+            alpha=self.alpha,
+            beta=self.beta,
+            temperature=current_temp,
+        ).solve(overloaded, underloaded, pressures, confidences)
 
-        return actions
+    # ------------------------------------------------------------------
+    # Publish
+    # ------------------------------------------------------------------
 
-    def compute_pressures(self) -> Dict[str, float]:
-        """
-        Compute pressure for each service.
-
-        P_i = L_opt_i - L_i
-        P_i > 0: underloaded (can accept traffic)
-        P_i < 0: overloaded (needs to shed traffic)
-        """
-        pressures = {}
-        for service_id, state in self.global_state.items():
-            L_i = state["L_i"]
-            L_opt_i = state["L_opt_i"]
-            pressure = L_opt_i - L_i
-            pressures[service_id] = pressure
-            logger.debug(f"Pressure for {service_id}: {pressure:.3f} (L_i={L_i:.3f}, L_opt={L_opt_i:.3f})")
-
-        return pressures
-
-    def partition_nodes(self, pressures: Dict[str, float]) -> Tuple[List[str], List[str]]:
-        """
-        Partition services into overloaded and underloaded sets.
-
-        Returns:
-            Tuple of (overloaded_services, underloaded_services)
-        """
-        overloaded = [sid for sid, p in pressures.items() if p < 0]
-        underloaded = [sid for sid, p in pressures.items() if p > 0]
-
-        logger.info(f"Overloaded services: {overloaded}")
-        logger.info(f"Underloaded services: {underloaded}")
-
-        return overloaded, underloaded
-
-    def compute_flows(self, overloaded: List[str], underloaded: List[str],
-                     pressures: Dict[str, float]) -> List[Dict]:
-        """
-        Compute redistribution flows between overloaded and underloaded services.
-
-        For each pair (i ∈ O, j ∈ U):
-        flow_i→j ∝ w_i * w_j * |P_i| * P_j
-
-        Normalize flows so that:
-        - outgoing from i ≤ |P_i|
-        - incoming to j ≤ P_j
-        """
-        actions = []
-
-        # Compute raw flows
-        raw_flows = defaultdict(float)
-        total_possible_flow = 0
-
-        for i in overloaded:
-            for j in underloaded:
-                w_i = self.global_state[i]["confidence"]
-                w_j = self.global_state[j]["confidence"]
-                p_i = abs(pressures[i])  # |P_i|
-                p_j = pressures[j]       # P_j
-
-                # Flow proportional to weights and pressures
-                flow = w_i * w_j * p_i * p_j
-                raw_flows[(i, j)] = flow
-                total_possible_flow += flow
-
-        if total_possible_flow == 0:
-            return []
-
-        # Normalize flows
-        normalized_actions = self.normalize_flows(raw_flows, overloaded, underloaded, pressures)
-
-        # Convert to action format
-        for (from_service, to_service), intensity in normalized_actions.items():
-            if intensity > 0.001:  # Only include significant actions
-                actions.append({
-                    "from": from_service,
-                    "to": to_service,
-                    "intensity": round(intensity, 3)
-                })
-
-        return actions
-
-    def normalize_flows(self, raw_flows: Dict[Tuple[str, str], float],
-                       overloaded: List[str], underloaded: List[str],
-                       pressures: Dict[str, float]) -> Dict[Tuple[str, str], float]:
-        """
-        Normalize flows to ensure constraints are met.
-
-        - outgoing from i ≤ |P_i|
-        - incoming to j ≤ P_j
-        """
-        normalized = {}
-
-        # First, scale flows to respect outgoing constraints
-        outgoing_scaled = {}
-        for i in overloaded:
-            outgoing_flows = {pair: flow for pair, flow in raw_flows.items() if pair[0] == i}
-            if not outgoing_flows:
-                continue
-
-            total_outgoing = sum(outgoing_flows.values())
-            max_outgoing = abs(pressures[i])
-
-            if total_outgoing > max_outgoing:
-                # Scale down to fit constraint
-                scale_factor = max_outgoing / total_outgoing
-                for pair, flow in outgoing_flows.items():
-                    outgoing_scaled[pair] = flow * scale_factor
-            else:
-                outgoing_scaled.update(outgoing_flows)
-
-        # Then, scale flows to respect incoming constraints
-        incoming_scaled = {}
-        for j in underloaded:
-            incoming_flows = {pair: flow for pair, flow in outgoing_scaled.items() if pair[1] == j}
-            if not incoming_flows:
-                continue
-
-            total_incoming = sum(incoming_flows.values())
-            max_incoming = pressures[j]
-
-            if total_incoming > max_incoming:
-                # Scale down to fit constraint
-                scale_factor = max_incoming / total_incoming
-                for pair, flow in incoming_flows.items():
-                    incoming_scaled[pair] = flow * scale_factor
-            else:
-                incoming_scaled.update(incoming_flows)
-
-        # Final normalization to ensure total flow balance
-        total_flow = sum(incoming_scaled.values())
-        if total_flow > 0:
-            # Normalize to sum to 1 (or some maximum total flow)
-            max_total_flow = 1.0
-            if total_flow > max_total_flow:
-                scale_factor = max_total_flow / total_flow
-                for pair in incoming_scaled:
-                    incoming_scaled[pair] *= scale_factor
-
-        return incoming_scaled
-
-    def apply_iterative_refinement(self):
-        """
-        Apply iterative refinement to improve convergence.
-
-        L_i(k+1) = L_i(k) + α(L_opt_i - L_i(k)) + β Σ W_ij (L_j(k) - L_i(k)) + T_i * ξ_i
-        """
-        # Update temperature
-        self.temperature *= (1 - self.gamma)
-
-        # This is a simplified version - full implementation would require
-        # adjacency matrix W_ij and noise term ξ_i
-        TODO: Implementnoise and adjacency-based-refinement 
-
-    def publish_actions(self, actions: List[Dict]):
-        """
-        Publish computed actions to policy.decisions topic.
-
-        Args:
-            actions: List of action dicts [{"from": str, "to": str, "intensity": float}, ...]
-        """
+    def _publish_actions(self, actions: List[Dict]):
         decision_id = f"topo-{self.service_id}-{int(time.time())}"
 
         decision_value = PolicyDecisionValue(
-            service=self.service_id,
-            decision=json.dumps({"actions": actions}),
-            risk_level=self.assess_risk_level(actions),
-            status=PolicyStatus.PENDING,
-            timestamp=datetime.now(),
-            metadata={
-                "agent_type": "topography",
-                "iteration": self.iteration_count,
+            service    = self.service_id,
+            decision   = json.dumps({"actions": actions}),
+            risk_level = self._assess_risk(actions),
+            status     = PolicyStatus.PENDING,
+            timestamp  = datetime.now(),
+            metadata   = {
+                "agent_type":        "topography",
+                "solver":            "convex_qp_entropy_regularised",
+                "iteration":         self.iteration_count,
                 "global_state_size": len(self.global_state),
-                "temperature": self.temperature
-            }
+                "temperature":       self.temperature * ((1 - self.gamma) ** self.iteration_count),
+                "alpha":             self.alpha,
+                "beta":              self.beta,
+                "gamma":             self.gamma,
+            },
         )
 
-        decision = PolicyDecision(
-            key=decision_id,
-            value=decision_value
+        success = self.producer.send(
+            "policy.decisions",
+            PolicyDecision(key=decision_id, value=decision_value)
         )
 
-        success = self.producer.send("policy.decisions", decision)
         if success:
-            logger.info(f"Published decision {decision_id} with {len(actions)} actions")
+            logger.info(f"Published {decision_id} — {len(actions)} actions")
+            self.iteration_count += 1
         else:
-            logger.error(f"Failed to publish decision {decision_id}")
+            logger.error(f"Failed to publish {decision_id}")
 
-    def assess_risk_level(self, actions: List[Dict]) -> RiskLevel:
-        """
-        Assess risk level of the computed actions.
-
-        Args:
-            actions: List of action dicts
-
-        Returns:
-            RiskLevel enum value
-        """
+    def _assess_risk(self, actions: List[Dict]) -> RiskLevel:
         if not actions:
             return RiskLevel.LOW
-
-        total_intensity = sum(action["intensity"] for action in actions)
-        max_intensity = max(action["intensity"] for action in actions)
-
-        # Simple risk assessment based on total and max intensity
-        if total_intensity > 0.8 or max_intensity > 0.5:
+        total = sum(a["intensity"] for a in actions)
+        peak  = max(a["intensity"] for a in actions)
+        if total > 0.8 or peak > 0.5:
             return RiskLevel.HIGH
-        elif total_intensity > 0.5 or max_intensity > 0.3:
+        if total > 0.5 or peak > 0.3:
             return RiskLevel.MEDIUM
-        else:
-            return RiskLevel.LOW
+        return RiskLevel.LOW
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def close(self):
-        """Graceful shutdown."""
         self.producer.close()
         super().close()
 
-if __name__ == "__main__":
-    # For testing/development
-    import sys
 
+if __name__ == "__main__":
+    import sys
     service_id = sys.argv[1] if len(sys.argv) > 1 else "aks"
     agent = TopographyAgent(service_id=service_id)
-
     try:
         logger.info(f"Starting Topography Agent for {service_id}")
         agent.start()
