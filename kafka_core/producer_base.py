@@ -69,6 +69,7 @@ import json
 import logging
 from typing import Any
 from datetime import datetime
+from enum import Enum
 from json import JSONEncoder
 
 try:
@@ -98,6 +99,8 @@ class DateTimeEncoder(JSONEncoder):
     def default(self, obj: Any) -> Any:
         if isinstance(obj, datetime):
             return obj.isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
         return super().default(obj)
 
 
@@ -135,7 +138,13 @@ class KafkaProducerTemplate:
             logger.error(f"Failed to initialize Kafka Producer: {e}")
             raise KafkaProducerError(f"Producer initialization failed: {e}")
 
-    def send(self, topic: str, event: BaseModel) -> str:
+    def send(
+        self,
+        topic: str,
+        event: BaseModel,
+        key: str = None,
+        partition: int = None,
+    ) -> str:
         """
         Send event to Kafka topic (blocking).
         
@@ -154,7 +163,11 @@ class KafkaProducerTemplate:
 
         try:
             # Extract key and value from event
-            key = event.key if hasattr(event, "key") else None
+            key = (
+                key
+                if key is not None
+                else event.key if hasattr(event, "key") else None
+            )
             value = event.value if hasattr(event, "value") else event
 
             # Send to Kafka
@@ -162,6 +175,7 @@ class KafkaProducerTemplate:
                 topic,
                 key=key,
                 value=value.dict() if isinstance(value, BaseModel) else value,
+                partition=partition,
             )
 
             # Block until send completes
@@ -187,3 +201,8 @@ class KafkaProducerTemplate:
         if self.producer:
             self.producer.close()
             logger.info("Kafka Producer closed")
+
+    def flush(self) -> None:
+        """Flush pending records to Kafka."""
+        if self.producer:
+            self.producer.flush()

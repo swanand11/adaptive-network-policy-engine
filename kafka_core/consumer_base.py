@@ -80,17 +80,18 @@ DEPENDENCIES:
 
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 
 try:
-    from kafka import KafkaConsumer
+    from kafka import KafkaConsumer, TopicPartition
+    from kafka.structs import OffsetAndMetadata
     from kafka.errors import KafkaError
-except ImportError:  # pragma: no cover
+except ImportError:
     KafkaConsumer = None
-
-    class KafkaError(Exception):
-        pass
+    TopicPartition = None
+    OffsetAndMetadata = None
+    KafkaError = None
 
 from .config import KafkaConfig
 from .exceptions import KafkaConsumerError
@@ -114,7 +115,12 @@ class KafkaConsumerTemplate(ABC):
         agent.start()
     """
 
-    def __init__(self, topics: List[str], group_id: str):
+    def __init__(
+        self,
+        topics: List[str],
+        group_id: str,
+        partitions: Optional[Dict[str, List[int]]] = None,
+    ):
         """
         Initialize Kafka Consumer.
         
@@ -124,6 +130,7 @@ class KafkaConsumerTemplate(ABC):
         """
         self.topics = topics
         self.group_id = group_id
+        self.partitions = partitions or {}
         self.consumer = None
         self._initialize_consumer()
 
@@ -135,11 +142,24 @@ class KafkaConsumerTemplate(ABC):
         try:
             config = KafkaConfig.get_consumer_config(self.group_id)
             self.consumer = KafkaConsumer(
-                *self.topics,
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")) if m else None,
                 key_deserializer=lambda k: k.decode("utf-8") if k else None,
                 **config,
             )
+            if self.partitions:
+                topic_partitions = [
+                    TopicPartition(topic, partition)
+                    for topic, partitions in self.partitions.items()
+                    for partition in partitions
+                ]
+                self.consumer.assign(topic_partitions)
+                logger.info(
+                    "Consumer assigned: group_id='%s', partitions=%s",
+                    self.group_id,
+                    topic_partitions,
+                )
+            else:
+                self.consumer.subscribe(self.topics)
             logger.info(f"Consumer initialized: group_id='{self.group_id}', topics={self.topics}")
         except Exception as e:
             logger.error(f"Failed to initialize consumer: {e}")

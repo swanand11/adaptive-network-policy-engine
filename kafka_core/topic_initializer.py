@@ -71,8 +71,8 @@ DEPENDENCIES:
 import logging
 from typing import List, Dict, Optional
 
-from kafka.admin import KafkaAdminClient, NewTopic
-from kafka.errors import TopicAlreadyExistsError, KafkaError
+from kafka.admin import KafkaAdminClient, NewPartitions, NewTopic
+from kafka.errors import InvalidPartitionsError, TopicAlreadyExistsError, KafkaError
 
 from .config import KafkaConfig, TopicConfig
 from .exceptions import TopicInitializationError
@@ -150,25 +150,120 @@ class TopicInitializer:
                 replication_factor=replication_factor,
                 topic_configs=topic_config.to_kafka_config()["config"],
             )
-
-            # Create topic
-            fs = self.admin_client.create_topics(new_topics=[new_topic], validate_only=False)
-            
-            # Wait for creation
-            for topic, future in fs.items():
-                try:
-                    future.result(timeout_sec=10)
-                    logger.info(
-                        f"Topic created: '{topic}' "
-                        f"(partitions={num_partitions}, replication_factor={replication_factor})"
-                    )
-                    return True
-                except TopicAlreadyExistsError:
-                    logger.info(f"Topic already exists: '{topic}'")
-                    return True
-
+            futures = self.admin_client.create_topics(new_topics=[new_topic], validate_only=False)
+            if hasattr(futures, "items"):
+                for topic, future in futures.items():
+                    try:
+                        future.result(timeout=10)
+                        logger.info(
+                            "Topic created: '%s' (partitions=%s, replication_factor=%s)",
+                            topic,
+                            num_partitions,
+                            replication_factor,
+                        )
+                    except TopicAlreadyExistsError:
+                        logger.info("Topic already exists: '%s'", topic)
+            else:
+                logger.info(
+                    "Topic create request accepted for '%s' (partitions=%s, replication_factor=%s)",
+                    topic_name,
+                    num_partitions,
+                    replication_factor,
+                )
+        except TopicAlreadyExistsError:
+            logger.info("Topic already exists: '%s'", topic_name)
         except Exception as e:
             logger.error(f"Error creating topic '{topic_name}': {e}")
+            return False
+
+        # Enforce configured partition requirements for existing and new topics.
+        if num_partitions:
+            return self._ensure_min_partitions(topic_name, num_partitions)
+        return True
+
+    def _topic_partition_count(self, topic_name: str) -> Optional[int]:
+        """Return the current partition count for topic_name, if Kafka reports it."""
+        if not self.admin_client:
+            raise TopicInitializationError("Admin client not initialized")
+
+        metadata = self.admin_client.describe_topics(topics=[topic_name])
+
+        if isinstance(metadata, dict):
+            topic_metadata = metadata.get(topic_name)
+        else:
+            topic_metadata = next(
+                (
+                    item
+                    for item in metadata
+                    if item.get("topic") == topic_name or item.get("name") == topic_name
+                ),
+                None,
+            )
+
+        if not topic_metadata:
+            return None
+
+        partitions = topic_metadata.get("partitions", [])
+        return len(partitions)
+
+    def _ensure_min_partitions(self, topic_name: str, min_partitions: int) -> bool:
+        """
+        Ensure an existing topic has at least min_partitions.
+
+        Kafka can increase a topic's partition count, but cannot reduce it. If
+        the topic already has enough partitions, this is a no-op.
+        """
+        try:
+            current_partitions = self._topic_partition_count(topic_name)
+            if current_partitions is None:
+                logger.warning("Could not inspect partitions for topic '%s'", topic_name)
+                return False
+
+            if current_partitions >= min_partitions:
+                logger.info(
+                    "Topic '%s' has %s partition(s), required minimum is %s",
+                    topic_name,
+                    current_partitions,
+                    min_partitions,
+                )
+                return True
+
+            logger.info(
+                "Increasing partitions for topic '%s' from %s to %s",
+                topic_name,
+                current_partitions,
+                min_partitions,
+            )
+            futures = self.admin_client.create_partitions(
+                {topic_name: NewPartitions(total_count=min_partitions)},
+                validate_only=False,
+            )
+            if hasattr(futures, "items"):
+                for topic, future in futures.items():
+                    future.result(timeout=10)
+                    logger.info(
+                        "Partitions increased for topic '%s' to %s",
+                        topic,
+                        min_partitions,
+                    )
+            return True
+        except InvalidPartitionsError:
+            current_partitions = self._topic_partition_count(topic_name)
+            if current_partitions and current_partitions >= min_partitions:
+                return True
+            logger.error(
+                "Invalid partition increase requested for topic '%s' to %s",
+                topic_name,
+                min_partitions,
+            )
+            return False
+        except Exception as e:
+            logger.error(
+                "Error ensuring partitions for topic '%s' (min=%s): %s",
+                topic_name,
+                min_partitions,
+                e,
+            )
             return False
 
     def create_all_topics(self) -> Dict[str, bool]:

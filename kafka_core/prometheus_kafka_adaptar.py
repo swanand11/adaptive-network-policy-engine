@@ -50,6 +50,7 @@ try:
     from .schemas import MetricsEvent, MetricsEventValue
     from .producer_base import KafkaProducerTemplate
     from .enums import CloudProvider
+    from .pipeline import service_key
 except ImportError as e:
     print(f"Warning: Could not import Kafka modules: {e}")
     print("Make sure kafka package is in PYTHONPATH")
@@ -60,17 +61,20 @@ ENDPOINTS = {
     "aws": {
         "url": "http://aws-simulator:8001/metrics",
         "cloud": CloudProvider.AWS,
-        "service_id": "service-cache-aws"
+        "service_id": "service-cache-aws",
+        "partition": 0,
     },
     "aks": {
         "url": "http://aks-simulator:8002/metrics",
         "cloud": CloudProvider.AZURE,
-        "service_id": "service-cache-aks"
+        "service_id": "service-cache-aks",
+        "partition": 1,
     },
     "droplet": {
         "url": "http://digitalocean-simulator:8003/metrics",
         "cloud": CloudProvider.DIGITALOCEAN,
-        "service_id": "service-cache-droplet"
+        "service_id": "service-cache-droplet",
+        "partition": 2,
     }
 }
 
@@ -336,9 +340,7 @@ class PrometheusMetricsAdapter:
                 normalized = self.normalizer.normalize(parsed_metrics)
                 logger.debug(f"Normalized metrics for {endpoint_name}: {normalized}")
                 
-                # Create Kafka event with partition key: cloud+service
-                # This ensures all metrics from same service/cloud go to same partition
-                partition_key = f"{config['cloud'].value.lower()}:{config['service_id']}"
+                partition_key = service_key(config["service_id"], config["cloud"].value)
                 event = MetricsEvent(
                     key=partition_key,
                     value=MetricsEventValue(
@@ -352,7 +354,12 @@ class PrometheusMetricsAdapter:
                 
                 # Send to Kafka
                 try:
-                    record_meta = self.producer.send(topic="metrics.events",value=event,key=partition_key)
+                    record_meta = self.producer.send(
+                        topic="metrics.events",
+                        event=event,
+                        key=partition_key,
+                        partition=config.get("partition"),
+                    )
                     logger.info(f"Sent metrics for {endpoint_name} to Kafka: {record_meta}")
                 except Exception as e:
                     logger.error(f"Failed to send {endpoint_name} metrics to Kafka: {e}")

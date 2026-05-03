@@ -10,6 +10,8 @@ KEY CLASSES:
 
 TOPICS CONFIGURED:
   - metrics.events (3 partitions): Raw metrics from mock/real services
+  - service.state (3 partitions): Service-agent belief and intent state
+  - topo.decisions (3 partitions): Topology redistribution decisions
   - system.audit.log (1 partition): Audit trail for all actions and decisions
   - policy.decisions (2 partitions): Agent decisions pending approval/execution
   - policy.executions (2 partitions): Execution results of approved policies
@@ -90,6 +92,12 @@ class KafkaConfig:
             retention_ms=7 * 24 * 60 * 60 * 1000,
             partition_key_field="service_id",
         ),
+        "service.state": TopicConfig(
+            name="service.state",
+            partitions=3,
+            retention_ms=7 * 24 * 60 * 60 * 1000,
+            partition_key_field="service_id",
+        ),
         "system.audit.log": TopicConfig(
             name="system.audit.log",
             partitions=1,
@@ -107,6 +115,12 @@ class KafkaConfig:
             partitions=2,
             retention_ms=7 * 24 * 60 * 60 * 1000,
             partition_key_field="execution_id",
+        ),
+        "topo.decisions": TopicConfig(
+            name="topo.decisions",
+            partitions=3,
+            retention_ms=7 * 24 * 60 * 60 * 1000,
+            partition_key_field="topo_decision_id",
         ),
     }
 

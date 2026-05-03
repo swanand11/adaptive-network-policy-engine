@@ -35,15 +35,14 @@ Architecture:
 import logging
 import math
 import time
-import json
 from typing import Dict, List, Optional
 from datetime import datetime
-import config
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
-from kafka_core.schemas import TopoDecision, TopoDecisionValue
+from kafka_core.schemas import ServiceStateValue, TopoDecision, TopoDecisionValue
 from kafka_core.enums import PolicyStatus, RiskLevel
 from kafka_core.schemas import TopoAction
+from kafka_core.pipeline import service_partition
 
 
 logging.basicConfig(level=logging.INFO)
@@ -252,20 +251,26 @@ class TopographyAgent(KafkaConsumerTemplate):
         service_id: str = "do",
         consumer: Optional[KafkaConsumerTemplate] = None,
         producer: Optional[KafkaProducerTemplate] = None,
+        group_id: Optional[str] = None,
+        partitions: Optional[Dict[str, List[int]]] = None,
     ):
         if consumer:
             self.consumer = consumer
         else:
             super().__init__(
-                topics=["metrics.events"],
-                group_id=f"topography-{service_id}"
+                topics=["service.state"],
+                group_id=group_id or f"topography-{service_id}",
+                partitions=partitions,
             )
 
         self.service_id = service_id
         self.producer   = producer or KafkaProducerTemplate()
+        self._owns_producer = producer is None
 
         # Global state: service_id → {L_i, L_opt_i, confidence}
         self.global_state: Dict[str, Dict] = {}
+        self.latest_correlation_id: Optional[str] = None
+        self.latest_parent_event_id: Optional[str] = None
 
         # Hyper-parameters
         self.alpha       = 0.35   # fraction of |pressure| available for redistribution
@@ -275,7 +280,7 @@ class TopographyAgent(KafkaConsumerTemplate):
 
         self.iteration_count       = 0
         self.last_computation_time = 0.0
-        self.computation_interval  = 5.0
+        self.computation_interval  = 0.0
 
         logger.info(f"Topography Agent initialised for service {service_id}")
 
@@ -286,25 +291,35 @@ class TopographyAgent(KafkaConsumerTemplate):
     def process_message(self, topic: str, message: dict) -> bool:
         try:
             if "value" in message and "service" in message["value"]:
-                service_id = message["value"]["service"]
-                metrics    = message["value"].get("metrics", {})
+                value = message["value"]
+                service_id = value["service"]
+                metrics = value.get("metrics", {})
+                self.global_state[service_id] = {
+                    "L_i": metrics.get("L_i", 0.0),
+                    "L_opt_i": metrics.get("L_opt_i", 0.0),
+                    "confidence": metrics.get("confidence", 0.0),
+                }
+                self.latest_correlation_id = value.get("correlation_id")
+                self.latest_parent_event_id = value.get("parent_event_id")
+            else:
+                state = ServiceStateValue(**message)
+                service_id = state.service
+                intent = state.intent
+                belief = state.belief
+                self.global_state[service_id] = {
+                    "L_i": intent.get("current_load") if isinstance(intent, dict) else intent.current_load,
+                    "L_opt_i": intent.get("optimal_load") if isinstance(intent, dict) else intent.optimal_load,
+                    "confidence": belief.get("confidence") if isinstance(belief, dict) else belief.confidence,
+                }
+                self.latest_correlation_id = state.correlation_id
+                self.latest_parent_event_id = state.parent_event_id
+            logger.debug(f"Updated state for {service_id}: {self.global_state[service_id]}")
 
-                if "L_i" in metrics and "L_opt_i" in metrics:
-                    self.global_state[service_id] = {
-                        "L_i":        metrics.get("L_i",        0.0),
-                        "L_opt_i":    metrics.get("L_opt_i",    0.0),
-                        "confidence": metrics.get("confidence", 0.0),
-                    }
-                    logger.debug(f"Updated state for {service_id}: {self.global_state[service_id]}")
-
-                    current_time = time.time()
-                    if current_time - self.last_computation_time >= self.computation_interval:
-                        self._compute_and_publish()
-                        self.last_computation_time = current_time
-                return True
-
-            logger.warning(f"Invalid message format: {message}")
-            return False
+            current_time = time.time()
+            if current_time - self.last_computation_time >= self.computation_interval:
+                self._compute_and_publish()
+                self.last_computation_time = current_time
+            return True
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -320,10 +335,9 @@ class TopographyAgent(KafkaConsumerTemplate):
             return
         try:
             actions = self._compute_redistribution_actions()
-            if actions:
-                self._publish_actions(actions)
-            else:
-                logger.info("No redistribution actions needed")
+            self._publish_actions(actions)
+            if not actions:
+                logger.info("Published no-op topology decision")
         except Exception as e:
             logger.error(f"Error computing actions: {e}")
 
@@ -381,11 +395,16 @@ class TopographyAgent(KafkaConsumerTemplate):
                     "beta": self.beta,
                     "gamma": self.gamma,
                 },
+                correlation_id=self.latest_correlation_id,
+                parent_event_id=self.latest_parent_event_id,
             )
 
+        partition = service_partition(self.service_id, None)
         success = self.producer.send(
             "topo.decisions",
-            TopoDecision(key=decision_id, value=decision_value)
+            TopoDecision(key=decision_id, value=decision_value),
+            key=decision_id,
+            partition=partition,
         )
 
         if success:
@@ -410,7 +429,8 @@ class TopographyAgent(KafkaConsumerTemplate):
     # ------------------------------------------------------------------
 
     def close(self):
-        self.producer.close()
+        if self._owns_producer:
+            self.producer.close()
         super().close()
 
 
