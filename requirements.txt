@@ -8,3 +8,4 @@ pydantic>=1.10.0
 python-dotenv>=0.20.0
 pytest
 pyyaml>=6.0.0
+pymongo>=4.0.0

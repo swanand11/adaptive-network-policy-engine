@@ -114,6 +114,12 @@ class KafkaConfig:
             retention_ms=7 * 24 * 60 * 60 * 1000,
             partition_key_field="execution_id",
         ),
+        "topo.decisions": TopicConfig(
+            name="topo.decisions",
+            partitions=2,
+            retention_ms=7 * 24 * 60 * 60 * 1000,
+            partition_key_field="decision_id",
+        ),
     }
 
     @classmethod
