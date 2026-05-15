@@ -91,12 +91,16 @@ from .enums import CloudProvider, PolicyStatus, ExecutionStatus, RiskLevel
 # ============================================================
 class MetricsEventValue(BaseModel):
     """Value schema for metrics.events topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
     service: str = Field(..., description="Service identifier")
     cloud: CloudProvider = Field(..., description="Cloud provider")
     timestamp: datetime = Field(..., description="Event timestamp")
     metrics: Dict[str, Any] = Field(default_factory=dict, description="Metric data (CPU, latency, etc.)")
     correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
     parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+    producer_agent: Optional[str] = Field(None, description="Agent that produced this event")
+    source_offset: Optional[str] = Field(None, description="Kafka source topic/partition/offset")
+    depth: int = Field(0, description="Lineage depth from the adapter event")
 
     class Config:
         use_enum_values = False
@@ -127,6 +131,7 @@ class ServiceStateIntent(BaseModel):
 
 class ServiceStateValue(BaseModel):
     """Value schema for service.state topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
     service: str = Field(..., description="Service identifier")
     cloud: CloudProvider = Field(..., description="Cloud provider")
     timestamp: datetime = Field(..., description="Event timestamp")
@@ -135,6 +140,9 @@ class ServiceStateValue(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
     correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
     parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+    producer_agent: Optional[str] = Field(None, description="Agent that produced this event")
+    source_offset: Optional[str] = Field(None, description="Kafka source topic/partition/offset")
+    depth: int = Field(0, description="Lineage depth from the adapter event")
 
     class Config:
         use_enum_values = False
@@ -231,6 +239,7 @@ class TopoAction(BaseModel):
 
 class TopoDecisionValue(BaseModel):
     """Value schema for topo.decisions topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
     service: str = Field(..., description="Agent/service emitting decision")
     actions: List[TopoAction] = Field(
         ..., description="List of redistribution actions"
@@ -250,6 +259,13 @@ class TopoDecisionValue(BaseModel):
     parent_event_id: Optional[str] = Field(
         None, description="Upstream event reference"
     )
+    producer_agent: Optional[str] = Field(
+        None, description="Agent that produced this event"
+    )
+    source_offset: Optional[str] = Field(
+        None, description="Kafka source topic/partition/offset"
+    )
+    depth: int = Field(0, description="Lineage depth from the adapter event")
 
     class Config:
         use_enum_values = False

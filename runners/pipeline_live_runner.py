@@ -140,15 +140,181 @@ class AdapterLoop:
         self.poller.session.close()
 
     def run(self) -> None:
-        cycle = 0
-        while self.running:
+        """
+        Controlled deterministic pipeline execution.
+
+        Behavior:
+        - 5 events per CSP
+        - 3 CSPs total
+        - 15 total metrics events
+        - graceful termination
+        - clean readable logs
+        """
+
+        EVENTS_PER_CSP = 5
+
+        services = list(iter_services())
+
+        service_event_counts = {
+            svc.service_id: 0
+            for svc in services
+        }
+
+        total_expected = EVENTS_PER_CSP * len(services)
+        total_sent = 0
+        cycle = 1
+
+        logger.info("=" * 80)
+        logger.info("STARTING CONTROLLED PIPELINE TEST")
+        logger.info("SERVICES=%s", [svc.service_id for svc in services])
+        logger.info("EVENTS_PER_CSP=%s", EVENTS_PER_CSP)
+        logger.info("TOTAL_EXPECTED=%s", total_expected)
+        logger.info("=" * 80)
+
+        while self.running and total_sent < total_expected:
+
+            cycle_id = uuid4().hex[:8]
+
+            logger.info(
+                "\n[PIPELINE-CYCLE-START] cycle=%s correlation=%s",
+                cycle,
+                cycle_id,
+            )
+
+            produced_this_cycle = 0
+
+            for svc in services:
+
+                # skip CSP if quota reached
+                if service_event_counts[svc.service_id] >= EVENTS_PER_CSP:
+                    continue
+
+                logger.info(
+                    "[STEP-1:POLL] service=%s partition=%s current=%s/%s",
+                    svc.service_id,
+                    svc.partition,
+                    service_event_counts[svc.service_id],
+                    EVENTS_PER_CSP,
+                )
+
+                started = time.monotonic()
+
+                dump = self.poller.poll(svc.metrics_url)
+
+                if not dump:
+                    logger.warning(
+                        "[POLL-FAILED] service=%s metrics_url=%s",
+                        svc.service_id,
+                        svc.metrics_url,
+                    )
+                    continue
+
+                parsed = PrometheusParser.parse_dump(dump)
+                metrics = MetricsNormalizer.normalize(parsed)
+
+                logger.info(
+                    "[STEP-2:NORMALIZED] "
+                    "service=%s latency=%s cpu=%s errors=%s",
+                    svc.service_id,
+                    metrics.get("request_latency_ms"),
+                    metrics.get("cpu_usage_percent"),
+                    metrics.get("error_rate_percent"),
+                )
+
+                event_id = f"metrics-{uuid4().hex}"
+
+                event = MetricsEvent(
+                    key=svc.key,
+                    value=MetricsEventValue(
+                        event_id=event_id,
+                        service=svc.service_id,
+                        cloud=svc.cloud,
+                        timestamp=datetime.now(timezone.utc),
+                        metrics=metrics,
+                        correlation_id=cycle_id,
+                        parent_event_id=f"cycle-{cycle}",
+                        producer_agent="prometheus-adapter",
+                        source_offset=None,
+                        depth=0,
+                    ),
+                )
+
+                metadata = self.producer.send(
+                    "metrics.events",
+                    event,
+                    key=svc.key,
+                    partition=svc.partition,
+                    producer_agent="prometheus-adapter",
+                )
+
+                elapsed = round((time.monotonic() - started) * 1000, 2)
+
+                logger.info(
+                    "[STEP-3:KAFKA-PRODUCED] "
+                    "service=%s partition=%s offset=%s "
+                    "event_id=%s correlation=%s latency_ms=%s",
+                    svc.service_id,
+                    metadata.get("partition"),
+                    metadata.get("offset"),
+                    event_id,
+                    cycle_id,
+                    elapsed,
+                )
+
+                self.hub.publish(
+                    {
+                        "stage": "adapter.sent",
+                        "topic": "metrics.events",
+                        "service": svc.service_id,
+                        "cloud": svc.cloud.value,
+                        "partition": svc.partition,
+                        "cycle": cycle,
+                        "event_id": event_id,
+                        "parent_event_id": f"cycle-{cycle}",
+                        "producer_agent": "prometheus-adapter",
+                        "source_offset": None,
+                        "correlation_id": cycle_id,
+                        "latency_ms": elapsed,
+                        "metadata": metadata,
+                    }
+                )
+
+                service_event_counts[svc.service_id] += 1
+                total_sent += 1
+                produced_this_cycle += 1
+
+                logger.info(
+                    "[EVENT-COMPLETE] "
+                    "service=%s service_total=%s/%s global_total=%s/%s",
+                    svc.service_id,
+                    service_event_counts[svc.service_id],
+                    EVENTS_PER_CSP,
+                    total_sent,
+                    total_expected,
+                )
+
+                time.sleep(0.5)
+
+            # safety termination
+            if produced_this_cycle == 0:
+                logger.info(
+                    "[PIPELINE-STOP] no remaining services require events"
+                )
+                break
+
             cycle += 1
-            cycle_id = uuid4().hex[:12]
-            cycle_started = time.monotonic()
-            for svc in iter_services():
-                self._poll_one(cycle, cycle_id, svc)
-            elapsed = time.monotonic() - cycle_started
-            time.sleep(max(0.0, self.interval - elapsed))
+
+        logger.info("=" * 80)
+        logger.info("CONTROLLED TEST FINISHED")
+        logger.info("TOTAL_EVENTS_SENT=%s", total_sent)
+        logger.info("FINAL_COUNTS=%s", service_event_counts)
+        logger.info("ALLOWING DOWNSTREAM FLUSH...")
+        logger.info("=" * 80)
+
+        # allow downstream agents to finish processing
+        time.sleep(10)
+
+        self.running = False
 
     def _poll_one(self, cycle: int, cycle_id: str, svc) -> None:
         started = time.monotonic()
@@ -168,15 +334,20 @@ class AdapterLoop:
 
         parsed = PrometheusParser.parse_dump(dump)
         metrics = MetricsNormalizer.normalize(parsed)
+        event_id = f"metrics-{uuid4().hex}"
         event = MetricsEvent(
             key=svc.key,
             value=MetricsEventValue(
+                event_id=event_id,
                 service=svc.service_id,
                 cloud=svc.cloud,
                 timestamp=datetime.now(timezone.utc),
                 metrics=metrics,
                 correlation_id=cycle_id,
                 parent_event_id=f"cycle-{cycle}",
+                producer_agent="prometheus-adapter",
+                source_offset=None,
+                depth=0,
             ),
         )
         metadata = self.producer.send(
@@ -184,6 +355,7 @@ class AdapterLoop:
             event,
             key=svc.key,
             partition=svc.partition,
+            producer_agent="prometheus-adapter",
         )
         self.hub.publish(
             {
@@ -193,6 +365,10 @@ class AdapterLoop:
                 "cloud": svc.cloud.value,
                 "partition": svc.partition,
                 "cycle": cycle,
+                "event_id": event_id,
+                "parent_event_id": f"cycle-{cycle}",
+                "producer_agent": "prometheus-adapter",
+                "source_offset": None,
                 "correlation_id": cycle_id,
                 "latency_ms": round((time.monotonic() - started) * 1000, 1),
                 "metadata": metadata,
@@ -246,10 +422,14 @@ class KafkaObserver(threading.Thread):
                                 "partition": rec.partition,
                                 "offset": rec.offset,
                                 "key": rec.key,
+                                "event_id": value.get("event_id"),
+                                "parent_event_id": value.get("parent_event_id"),
+                                "producer_agent": value.get("producer_agent"),
+                                "source_offset": value.get("source_offset"),
+                                "depth": value.get("depth"),
                                 "service": value.get("service"),
                                 "cloud": value.get("cloud"),
                                 "correlation_id": value.get("correlation_id"),
-                                "parent_event_id": value.get("parent_event_id"),
                                 "summary": summarize_payload(rec.topic, value),
                             }
                         )
@@ -354,7 +534,7 @@ HTML = """
     <section class="timeline">
       <h2>Live Event Timeline</h2>
       <table>
-        <thead><tr><th>Time</th><th>Stage</th><th>Topic</th><th>Partition</th><th>Service</th><th>Correlation</th><th>Summary</th></tr></thead>
+        <thead><tr><th>Time</th><th>Stage</th><th>Topic</th><th>Partition</th><th>Offset</th><th>Service</th><th>Event</th><th>Parent</th><th>Correlation</th><th>Producer</th><th>Source</th><th>Summary</th></tr></thead>
         <tbody id="events"></tbody>
       </table>
     </section>
@@ -375,7 +555,7 @@ HTML = """
     function rowFor(e) {
       const div = document.createElement("div");
       div.className = "row";
-      div.innerHTML = `<span class="pill">p${e.partition ?? "-"}</span><span><span class="svc">${e.service || "-"}</span><br><span class="meta">${summaryText(e.summary)}</span></span><span class="meta">#${e.offset ?? "-"}</span>`;
+      div.innerHTML = `<span class="pill">p${e.partition ?? "-"}</span><span><span class="svc">${e.service || "-"}</span><br><span class="meta">${short(e.event_id) || summaryText(e.summary)}</span></span><span class="meta">#${e.offset ?? "-"}</span>`;
       return div;
     }
     function renderTopic(topic) {
@@ -397,7 +577,7 @@ HTML = """
       body.innerHTML = "";
       events.slice().reverse().forEach(ev => {
         const tr = document.createElement("tr");
-        tr.innerHTML = `<td>${short(ev.seen_at)}</td><td>${ev.stage || ""}</td><td>${ev.topic || ""}</td><td>${ev.partition ?? ""}</td><td>${ev.service || ""}</td><td>${short(ev.correlation_id)}</td><td>${summaryText(ev.summary) || ev.error || ""}</td>`;
+        tr.innerHTML = `<td>${short(ev.seen_at)}</td><td>${ev.stage || ""}</td><td>${ev.topic || ""}</td><td>${ev.partition ?? ""}</td><td>${ev.offset ?? ""}</td><td>${ev.service || ""}</td><td>${short(ev.event_id)}</td><td>${short(ev.parent_event_id)}</td><td>${short(ev.correlation_id)}</td><td>${short(ev.producer_agent)}</td><td>${short(ev.source_offset)}</td><td>${summaryText(ev.summary) || ev.error || ""}</td>`;
         body.appendChild(tr);
       });
     }

@@ -78,7 +78,7 @@ class KafkaConfig:
     PRODUCER_RETRIES = int(os.getenv("KAFKA_PRODUCER_RETRIES", "3"))
 
     # Consumer settings
-    CONSUMER_AUTO_OFFSET_RESET = os.getenv("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "earliest")
+    CONSUMER_AUTO_OFFSET_RESET = os.getenv("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "latest")
     CONSUMER_ENABLE_AUTO_COMMIT = os.getenv("KAFKA_CONSUMER_ENABLE_AUTO_COMMIT", "false").lower() == "true"
 
     # Message encoding

@@ -80,6 +80,7 @@ DEPENDENCIES:
 
 import json
 import logging
+from collections import deque
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
 
@@ -132,6 +133,8 @@ class KafkaConsumerTemplate(ABC):
         self.group_id = group_id
         self.partitions = partitions or {}
         self.consumer = None
+        self._processed_event_ids = set()
+        self._processed_event_order = deque(maxlen=1000)
         self._initialize_consumer()
 
     def _initialize_consumer(self) -> None:
@@ -189,12 +192,38 @@ class KafkaConsumerTemplate(ABC):
         try:
             for record in self.consumer:
                 try:
+                    message = self._with_source_metadata(record)
+                    if self._should_drop_message(record, message):
+                        self.consumer.commit()
+                        continue
+                    value = message if isinstance(message, dict) else {}
+                    logger.info(
+                        "[KAFKA-CONSUME] agent=%s group_id=%s topic=%s partition=%s "
+                        "offset=%s event_id=%s parent_event_id=%s correlation_id=%s",
+                        self.__class__.__name__,
+                        self.group_id,
+                        record.topic,
+                        record.partition,
+                        record.offset,
+                        value.get("event_id"),
+                        value.get("parent_event_id"),
+                        value.get("correlation_id"),
+                    )
                     should_commit = self.process_message(
                         topic=record.topic,
-                        message=record.value,
+                        message=message,
                     )
                     if should_commit:
+                        self._remember_processed(message)
                         self.consumer.commit()
+                        logger.info(
+                            "[KAFKA-COMMIT] agent=%s group_id=%s topic=%s partition=%s offset=%s",
+                            self.__class__.__name__,
+                            self.group_id,
+                            record.topic,
+                            record.partition,
+                            record.offset + 1,
+                        )
                 except Exception as e:
                     logger.error(f"Error processing message from '{record.topic}': {e}")
 
@@ -249,6 +278,69 @@ class KafkaConsumerTemplate(ABC):
         """
         for msg in messages:
             self.process_message(topic=msg["topic"], message=msg["value"])
+
+    def _with_source_metadata(self, record) -> Dict[str, Any]:
+        message = dict(record.value or {})
+        message["_kafka_source"] = {
+            "topic": record.topic,
+            "partition": record.partition,
+            "offset": record.offset,
+        }
+        if not message.get("source_offset"):
+            message["source_offset"] = f"{record.topic}@{record.partition}:{record.offset}"
+        return message
+
+    def _message_identity(self, record, message: Dict[str, Any]) -> str:
+        event_id = message.get("event_id")
+        if event_id:
+            return f"event:{event_id}"
+        return f"offset:{record.topic}@{record.partition}:{record.offset}"
+
+    def _should_drop_message(self, record, message: Dict[str, Any]) -> bool:
+        identity = self._message_identity(record, message)
+        if identity in self._processed_event_ids:
+            logger.warning(
+                "[KAFKA-DUPLICATE-DROP] agent=%s group_id=%s topic=%s partition=%s "
+                "offset=%s event_id=%s correlation_id=%s",
+                self.__class__.__name__,
+                self.group_id,
+                record.topic,
+                record.partition,
+                record.offset,
+                message.get("event_id"),
+                message.get("correlation_id"),
+            )
+            return True
+        if int(message.get("depth") or 0) > 10:
+            logger.warning(
+                "[KAFKA-DEPTH-DROP] agent=%s group_id=%s topic=%s partition=%s "
+                "offset=%s event_id=%s correlation_id=%s depth=%s",
+                self.__class__.__name__,
+                self.group_id,
+                record.topic,
+                record.partition,
+                record.offset,
+                message.get("event_id"),
+                message.get("correlation_id"),
+                message.get("depth"),
+            )
+            return True
+        return False
+
+    def _remember_processed(self, message: Dict[str, Any]) -> None:
+        event_id = message.get("event_id")
+        source_offset = message.get("source_offset")
+        if event_id:
+            identity = f"event:{event_id}"
+        elif source_offset:
+            identity = f"offset:{source_offset}"
+        else:
+            return
+        if len(self._processed_event_order) == self._processed_event_order.maxlen:
+            expired = self._processed_event_order[0]
+            self._processed_event_ids.discard(expired)
+        self._processed_event_order.append(identity)
+        self._processed_event_ids.add(identity)
 
     def close(self) -> None:
         """Close the consumer."""

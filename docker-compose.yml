@@ -64,10 +64,10 @@ services:
       dockerfile: mocks/Dockerfile
     container_name: aws-simulator
     command: python -m mocks.aws_simulator
-    ports:
-      - "8001:8001"
     environment:
       SERVICE_PORT: "8001"
+    ports:
+      - "8001:8001"
     networks:
       - app-network
 
@@ -78,10 +78,10 @@ services:
       dockerfile: mocks/Dockerfile
     container_name: aks-simulator
     command: python -m mocks.aks_simulator
-    ports:
-      - "8002:8002"
     environment:
       SERVICE_PORT: "8002"
+    ports:
+      - "8002:8002"
     networks:
       - app-network
 
@@ -92,10 +92,76 @@ services:
       dockerfile: mocks/Dockerfile
     container_name: digitalocean-simulator
     command: python -m mocks.dodroplets_simulator
-    ports:
-      - "8003:8003"
     environment:
       SERVICE_PORT: "8003"
+    ports:
+      - "8003:8003"
+    networks:
+      - app-network
+
+  # Load Balancer Proxy
+  load-balancer-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: load-balancer-proxy
+    ports:
+      - "9000:9000"
+    depends_on:
+      - kafka
+      - aws-simulator
+      - aks-simulator
+      - digitalocean-simulator
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      AWS_ENDPOINT: http://aws-simulator:8001
+      AKS_ENDPOINT: http://aks-simulator:8002
+      DO_ENDPOINT: http://digitalocean-simulator:8003
+    networks:
+      - app-network
+
+  # Execution Consumer
+  execution-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: execution-consumer
+    command: python -m runners.execution_consumer
+    depends_on:
+      - kafka
+      - load-balancer-proxy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    networks:
+      - app-network
+
+  # Decision Producer
+  decision-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: decision-producer
+    command: python -m runners.decision_producer
+    depends_on:
+      - kafka
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    networks:
+      - app-network
+
+  # Traffic Generator
+  traffic-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: traffic-generator
+    command: python -m runners.traffic_generator
+    depends_on:
+      - load-balancer-proxy
+    environment:
+      PROXY_URL: "http://load-balancer-proxy:9000"
+      REQUESTS_PER_SECOND: "2"
+      TARGET_PATH: "/"
     networks:
       - app-network
 

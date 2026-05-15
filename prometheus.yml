@@ -41,3 +41,15 @@ scrape_configs:
       - source_labels: []
         target_label: service_id
         replacement: service-cache
+
+  - job_name: "execution-layer"
+    static_configs:
+      - targets: ["load-balancer-proxy:9000"]
+
+  - job_name: "kafka-exporter"
+    static_configs:
+      - targets: ["kafka-exporter:9308"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["prometheus:9090"]

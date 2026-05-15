@@ -231,6 +231,7 @@ class ServiceAgent(KafkaConsumerTemplate):
         service_state = ServiceState(
             key=partition_key,
             value=ServiceStateValue(
+                event_id=f"state-{uuid4().hex}",
                 service=event.value.service,
                 cloud=event.value.cloud,
                 timestamp=datetime.utcnow(),
@@ -243,9 +244,13 @@ class ServiceAgent(KafkaConsumerTemplate):
                     "memory_percent": memory_percent,
                     "normalized_cpu": current_cpu,
                     "normalized_error_rate": current_error,
+                    "source_offset": event.value.source_offset,
                 },
                 correlation_id=event.value.correlation_id,
-                parent_event_id=event.value.parent_event_id,
+                parent_event_id=event.value.event_id or event.value.parent_event_id,
+                producer_agent=f"service-agent-{self.service_id}",
+                source_offset=event.value.source_offset,
+                depth=(event.value.depth or 0) + 1,
             ),
         )
 
@@ -255,13 +260,16 @@ class ServiceAgent(KafkaConsumerTemplate):
             service_state,
             key=partition_key,
             partition=partition,
+            producer_agent=f"service-agent-{self.service_id}",
         )
         logger.info(
-            "Published service state %s for %s@%s: optimal_load=%s",
+            "Published service state %s for %s@%s: optimal_load=%s parent_event_id=%s correlation_id=%s",
             service_state.key,
             event.value.service,
             event.value.cloud,
             intent.get("optimal_load"),
+            service_state.value.parent_event_id,
+            service_state.value.correlation_id,
         )
         logger.debug("belief=%s intent=%s", belief, intent)
         return True

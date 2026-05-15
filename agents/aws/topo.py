@@ -37,6 +37,7 @@ import math
 import time
 from typing import Dict, List, Optional
 from datetime import datetime
+from uuid import uuid4
 from kafka_core.consumer_base import KafkaConsumerTemplate
 from kafka_core.producer_base import KafkaProducerTemplate
 from kafka_core.schemas import ServiceStateValue, TopoDecision, TopoDecisionValue
@@ -271,6 +272,11 @@ class TopographyAgent(KafkaConsumerTemplate):
         self.global_state: Dict[str, Dict] = {}
         self.latest_correlation_id: Optional[str] = None
         self.latest_parent_event_id: Optional[str] = None
+        self.latest_event_id: Optional[str] = None
+        self.latest_source_offset: Optional[str] = None
+        self.latest_depth: int = 0
+        self._published_by_correlation: Dict[str, int] = {}
+        self.max_decisions_per_correlation = 10
 
         # Hyper-parameters
         self.alpha       = 0.2  # fraction of |pressure| available for redistribution
@@ -290,6 +296,8 @@ class TopographyAgent(KafkaConsumerTemplate):
 
     def process_message(self, topic: str, message: dict) -> bool:
         try:
+            source = message.get("_kafka_source") or {}
+            source_offset = f"{source.get('topic')}@{source.get('partition')}:{source.get('offset')}" if source else message.get("source_offset")
             if "value" in message and "service" in message["value"]:
                 value = message["value"]
                 service_id = value["service"]
@@ -300,9 +308,15 @@ class TopographyAgent(KafkaConsumerTemplate):
                     "confidence": metrics.get("confidence", 0.0),
                 }
                 self.latest_correlation_id = value.get("correlation_id")
-                self.latest_parent_event_id = value.get("parent_event_id")
+                self.latest_parent_event_id = value.get("event_id") or value.get("parent_event_id")
+                self.latest_event_id = value.get("event_id")
+                self.latest_source_offset = source_offset or value.get("source_offset")
+                self.latest_depth = int(value.get("depth") or 0)
             else:
                 state = ServiceStateValue(**message)
+                if state.producer_agent and state.producer_agent.startswith("topography"):
+                    logger.warning("Dropping recursive topology-produced service.state event_id=%s", state.event_id)
+                    return True
                 service_id = state.service
                 intent = state.intent
                 belief = state.belief
@@ -312,7 +326,10 @@ class TopographyAgent(KafkaConsumerTemplate):
                     "confidence": belief.get("confidence") if isinstance(belief, dict) else belief.confidence,
                 }
                 self.latest_correlation_id = state.correlation_id
-                self.latest_parent_event_id = state.parent_event_id
+                self.latest_parent_event_id = state.event_id or state.parent_event_id
+                self.latest_event_id = state.event_id
+                self.latest_source_offset = source_offset or state.source_offset
+                self.latest_depth = int(state.depth or 0)
             logger.debug(f"Updated state for {service_id}: {self.global_state[service_id]}")
 
             current_time = time.time()
@@ -370,9 +387,27 @@ class TopographyAgent(KafkaConsumerTemplate):
     # ------------------------------------------------------------------
 
     def _publish_actions(self, actions: List[Dict]):
-        decision_id = f"topo-{self.service_id}-{int(time.time())}"
+        correlation_id = self.latest_correlation_id or "uncorrelated"
+        published = self._published_by_correlation.get(correlation_id, 0)
+        if self.latest_depth > 10:
+            logger.warning(
+                "Dropping topology decision for correlation_id=%s because depth=%s",
+                correlation_id,
+                self.latest_depth,
+            )
+            return
+        if published >= self.max_decisions_per_correlation:
+            logger.warning(
+                "Dropping topology decision for correlation_id=%s after %s decisions",
+                correlation_id,
+                published,
+            )
+            return
+
+        decision_id = f"topo-{self.service_id}-{uuid4().hex}"
 
         decision_value = TopoDecisionValue(
+                event_id=decision_id,
                 service=self.service_id,
                 actions=[
                     TopoAction(
@@ -390,13 +425,20 @@ class TopographyAgent(KafkaConsumerTemplate):
                     "solver": "convex_qp_entropy_regularised",
                     "iteration": self.iteration_count,
                     "global_state_size": len(self.global_state),
+                    "confidence": (
+                        sum(state["confidence"] for state in self.global_state.values())
+                        / len(self.global_state)
+                    ) if self.global_state else 0.0,
                     "temperature": self.temperature * ((1 - self.gamma) ** self.iteration_count),
                     "alpha": self.alpha,
                     "beta": self.beta,
                     "gamma": self.gamma,
                 },
                 correlation_id=self.latest_correlation_id,
-                parent_event_id=self.latest_parent_event_id,
+                parent_event_id=self.latest_event_id or self.latest_parent_event_id,
+                producer_agent=f"topography-{self.service_id}",
+                source_offset=self.latest_source_offset,
+                depth=self.latest_depth + 1,
             )
 
         partition = service_partition(self.service_id, None)
@@ -405,11 +447,13 @@ class TopographyAgent(KafkaConsumerTemplate):
             TopoDecision(key=decision_id, value=decision_value),
             key=decision_id,
             partition=partition,
+            producer_agent=f"topography-{self.service_id}",
         )
 
         if success:
             logger.info(f"Published {decision_id} — {len(actions)} actions")
             self.iteration_count += 1
+            self._published_by_correlation[correlation_id] = published + 1
         else:
             logger.error(f"Failed to publish {decision_id}")
 

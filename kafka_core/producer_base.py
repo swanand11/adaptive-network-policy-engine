@@ -144,7 +144,8 @@ class KafkaProducerTemplate:
         event: BaseModel,
         key: str = None,
         partition: int = None,
-    ) -> str:
+        producer_agent: str = None,
+    ) -> dict:
         """
         Send event to Kafka topic (blocking).
         
@@ -169,23 +170,45 @@ class KafkaProducerTemplate:
                 else event.key if hasattr(event, "key") else None
             )
             value = event.value if hasattr(event, "value") else event
+            payload = value.dict() if isinstance(value, BaseModel) else value
 
             # Send to Kafka
             future = self.producer.send(
                 topic,
                 key=key,
-                value=value.dict() if isinstance(value, BaseModel) else value,
+                value=payload,
                 partition=partition,
             )
 
             # Block until send completes
             record_metadata = future.get(timeout=10)
 
+            metadata = {
+                "topic": record_metadata.topic,
+                "partition": record_metadata.partition,
+                "offset": record_metadata.offset,
+            }
+            event_id = payload.get("event_id") if isinstance(payload, dict) else None
+            parent_event_id = payload.get("parent_event_id") if isinstance(payload, dict) else None
+            correlation_id = payload.get("correlation_id") if isinstance(payload, dict) else None
+            producer_name = (
+                producer_agent
+                or (payload.get("producer_agent") if isinstance(payload, dict) else None)
+                or "unknown"
+            )
             logger.info(
-                f"Message sent to topic='{topic}', partition={record_metadata.partition}, offset={record_metadata.offset}"
+                "[KAFKA-PRODUCE] producer=%s topic=%s partition=%s offset=%s "
+                "event_id=%s parent_event_id=%s correlation_id=%s",
+                producer_name,
+                record_metadata.topic,
+                record_metadata.partition,
+                record_metadata.offset,
+                event_id,
+                parent_event_id,
+                correlation_id,
             )
 
-            return f"{record_metadata.topic}@{record_metadata.partition}:{record_metadata.offset}"
+            return metadata
 
         except KafkaError as e:
             error_msg = f"Kafka error sending to topic '{topic}': {e}"
