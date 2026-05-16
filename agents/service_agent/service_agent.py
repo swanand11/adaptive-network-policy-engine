@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime
-from typing import Dict, Any, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from kafka_core.consumer_base import KafkaConsumerTemplate
@@ -8,11 +9,11 @@ from kafka_core.producer_base import KafkaProducerTemplate
 from kafka_core.schemas import (
     MetricsEventValue,
     ServiceState,
-    ServiceStateValue,
     ServiceStateBelief,
     ServiceStateIntent,
+    ServiceStateValue,
 )
-from types import SimpleNamespace
+from kafka_core.pipeline import service_key, service_partition
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,9 @@ logger = logging.getLogger(__name__)
 class ServiceAgent(KafkaConsumerTemplate):
     """
     Service Agent consumes metrics.events and produces service.state events.
-    
-    One instance per (service_id, cloud) pair for isolation and independent metrics tracking.
+
+    One instance per service_id/cloud pair gives each service independent
+    health estimation while preserving the Kafka pipeline.
     """
 
     def __init__(
@@ -35,36 +37,39 @@ class ServiceAgent(KafkaConsumerTemplate):
         cpu_threshold: float = 0.8,
         window_size: int = 5,
         group_id: str = "service_agent",
+        partition: Optional[int] = None,
     ):
-        super().__init__(topics=["metrics.events"], group_id=group_id)
+        partitions = {"metrics.events": [partition]} if partition is not None else None
+        super().__init__(
+            topics=["metrics.events"],
+            group_id=group_id,
+            partitions=partitions,
+        )
         self.service_id = service_id
-        self.cloud = cloud  # Cloud provider for this agent instance
+        self.cloud = cloud
         self.alpha = alpha
         self.latency_threshold = latency_threshold
         self.error_threshold = error_threshold
         self.cpu_threshold = cpu_threshold
         self.ewma_latency: Optional[float] = None
-        self.latency_window: list[float] = []
-        self.error_window: list[float] = []
+        self.latency_window = []
+        self.error_window = []
         self.window_size = window_size
-        
-        # Use provided cloud-specific producer, or fallback to creating own (for backward compatibility)
-        if cloud_producer is not None:
-            self.producer = cloud_producer
-        else:
-            self.producer = KafkaProducerTemplate()
+        self.producer = cloud_producer or KafkaProducerTemplate()
+        self._owns_producer = cloud_producer is None
 
     def update_ewma(self, current_latency: float) -> float:
         if self.ewma_latency is None:
             self.ewma_latency = current_latency
         else:
             self.ewma_latency = (
-                self.alpha * current_latency
-                + (1 - self.alpha) * self.ewma_latency
+                self.alpha * current_latency + (1 - self.alpha) * self.ewma_latency
             )
         return self.ewma_latency
 
-    def update_window(self, current_latency: float, error_rate: Optional[float]) -> None:
+    def update_window(
+        self, current_latency: float, error_rate: Optional[float]
+    ) -> None:
         self.latency_window.append(current_latency)
         if len(self.latency_window) > self.window_size:
             self.latency_window.pop(0)
@@ -79,11 +84,21 @@ class ServiceAgent(KafkaConsumerTemplate):
             return 0.0
         return self.latency_window[-1] - self.latency_window[-2]
 
-    def classify_status(self, latency: float, error_rate: Optional[float], cpu: Optional[float]) -> str:
-        """Classify service health status based on thresholds."""
-        if latency > self.latency_threshold * 1.5 or (error_rate and error_rate > self.error_threshold * 2):
+    def classify_status(
+        self,
+        latency: float,
+        error_rate: Optional[float],
+        cpu: Optional[float],
+    ) -> str:
+        if latency > self.latency_threshold * 1.5 or (
+            error_rate and error_rate > self.error_threshold * 2
+        ):
             return "overloaded"
-        if latency > self.latency_threshold or (error_rate and error_rate > self.error_threshold) or (cpu and cpu > self.cpu_threshold):
+        if (
+            latency > self.latency_threshold
+            or (error_rate and error_rate > self.error_threshold)
+            or (cpu and cpu > self.cpu_threshold)
+        ):
             return "stressed"
         return "healthy"
 
@@ -92,10 +107,15 @@ class ServiceAgent(KafkaConsumerTemplate):
             return 0.5
 
         latency_spread = max(self.latency_window) - min(self.latency_window)
-        error_spread = max(self.error_window) - min(self.error_window) if self.error_window else 0.0
-        score = 1.0 - min((latency_spread / 100.0), 0.5) - min((error_spread / 0.1), 0.3)
+        error_spread = (
+            max(self.error_window) - min(self.error_window)
+            if self.error_window
+            else 0.0
+        )
+        score = 1.0 - min(latency_spread / 100.0, 0.5) - min(
+            error_spread / 0.1, 0.3
+        )
         return round(max(min(score, 0.95), 0.5), 2)
-
 
     def estimate_current_load(
         self,
@@ -105,9 +125,16 @@ class ServiceAgent(KafkaConsumerTemplate):
     ) -> float:
         penalty = 0.0
         if latency > self.latency_threshold:
-            penalty += min((latency - self.latency_threshold) / (self.latency_threshold * 2), 0.5)
+            penalty += min(
+                (latency - self.latency_threshold)
+                / (self.latency_threshold * 2),
+                0.5,
+            )
         else:
-            penalty += max((latency - self.latency_threshold * 0.5) / self.latency_threshold, 0.0) * -0.1
+            penalty += max(
+                (latency - self.latency_threshold * 0.5) / self.latency_threshold,
+                0.0,
+            ) * -0.1
 
         if error_rate is not None:
             penalty += min(error_rate * 2.0, 0.5)
@@ -115,8 +142,7 @@ class ServiceAgent(KafkaConsumerTemplate):
         if cpu is not None:
             penalty += max((cpu - 0.5) * 0.4, 0.0)
 
-        current_load = 1.0 - penalty
-        return round(max(min(current_load, 0.95), 0.05), 2)
+        return round(max(min(1.0 - penalty, 0.95), 0.05), 2)
 
     def build_belief(
         self,
@@ -132,7 +158,7 @@ class ServiceAgent(KafkaConsumerTemplate):
 
         return {
             "latency_ewma": round(ewma, 2),
-            "trend": f"{'+ ' if trend_value >= 0 else ''}{round(trend_value, 2)}ms".replace('+ ', '+'),
+            "trend": f"{'+' if trend_value >= 0 else ''}{round(trend_value, 2)}ms",
             "confidence": confidence,
             "status": status,
         }
@@ -148,7 +174,6 @@ class ServiceAgent(KafkaConsumerTemplate):
             error_rate=current_error,
             cpu=current_cpu,
         )
-        # Compute optimal_load from EWMA latency only
         ewma = belief["latency_ewma"]
         r = ewma / float(self.latency_threshold) if self.latency_threshold else 1.0
         optimal_load = round(max(min(1.0 - r / 2.0, 0.95), 0.05), 2)
@@ -162,7 +187,11 @@ class ServiceAgent(KafkaConsumerTemplate):
         try:
             event = self._parse_metrics_event(message)
         except Exception as exc:
-            logger.error(f"Invalid metrics event (expected flat Shape B): {exc} | message={message}")
+            logger.error(
+                "Invalid metrics event (expected flat Shape B): %s | message=%s",
+                exc,
+                message,
+            )
             return False
 
         if event.value.service != self.service_id:
@@ -174,24 +203,35 @@ class ServiceAgent(KafkaConsumerTemplate):
             return True
 
         metrics = event.value.metrics
-        current_latency = self._extract_metric(metrics, "latency_ms", "request_latency_ms")
+        current_latency = self._extract_metric(
+            metrics, "latency_ms", "request_latency_ms"
+        )
         if current_latency is None:
             logger.warning("Skipping metrics event without latency_ms")
             return True
 
         raw_error = self._extract_metric(metrics, "error_rate", "error_rate_percent")
-        raw_cpu = self._extract_metric(metrics, "cpu_percent", "cpu", "cpu_usage_percent")
+        raw_cpu = self._extract_metric(
+            metrics, "cpu_percent", "cpu", "cpu_usage_percent"
+        )
         current_error = self._normalize_percentage(raw_error)
         current_cpu = self._normalize_percentage(raw_cpu)
-        current_throughput = self._extract_metric(metrics, "throughput", "requests_per_sec", "request_count")
-        memory_percent = self._extract_metric(metrics, "memory_percent", "memory", "memory_usage_percent")
+        current_throughput = self._extract_metric(
+            metrics, "throughput", "requests_per_sec", "request_count"
+        )
+        memory_percent = self._extract_metric(
+            metrics, "memory_percent", "memory", "memory_usage_percent"
+        )
 
         belief = self.build_belief(current_latency, current_error, current_cpu)
         intent = self.build_intent(belief, current_error, current_cpu)
 
+        cloud_value = getattr(event.value.cloud, "value", str(event.value.cloud))
+        partition_key = service_key(event.value.service, cloud_value)
         service_state = ServiceState(
-            key=str(uuid4()),
+            key=partition_key,
             value=ServiceStateValue(
+                event_id=f"state-{uuid4().hex}",
                 service=event.value.service,
                 cloud=event.value.cloud,
                 timestamp=datetime.utcnow(),
@@ -204,19 +244,32 @@ class ServiceAgent(KafkaConsumerTemplate):
                     "memory_percent": memory_percent,
                     "normalized_cpu": current_cpu,
                     "normalized_error_rate": current_error,
+                    "source_offset": event.value.source_offset,
                 },
                 correlation_id=event.value.correlation_id,
-                parent_event_id=event.value.parent_event_id,
+                parent_event_id=event.value.event_id or event.value.parent_event_id,
+                producer_agent=f"service-agent-{self.service_id}",
+                source_offset=event.value.source_offset,
+                depth=(event.value.depth or 0) + 1,
             ),
         )
 
-        self.producer.send("service.state", service_state)
+        partition = service_partition(event.value.service, cloud_value)
+        self.producer.send(
+            "service.state",
+            service_state,
+            key=partition_key,
+            partition=partition,
+            producer_agent=f"service-agent-{self.service_id}",
+        )
         logger.info(
-            "Published service state %s for %s@%s: optimal_load=%s",
+            "Published service state %s for %s@%s: optimal_load=%s parent_event_id=%s correlation_id=%s",
             service_state.key,
             event.value.service,
-            event.value.cloud.value,
-            intent.get("optimal_load", None),
+            event.value.cloud,
+            intent.get("optimal_load"),
+            service_state.value.parent_event_id,
+            service_state.value.correlation_id,
         )
         logger.debug("belief=%s intent=%s", belief, intent)
         return True
@@ -242,20 +295,13 @@ class ServiceAgent(KafkaConsumerTemplate):
             normalized = normalized / 100.0
         return round(max(min(normalized, 1.0), 0.0), 3)
 
-    def _parse_metrics_event(self, message: Dict[str, Any]) -> MetricsEventValue:
-        """Parse the flat adapter payload (Shape B) only.
-
-        Expects `message` to be the flat JSON with fields matching
-        `MetricsEventValue`. Constructs a simple object with `key` and
-        `value` attributes for compatibility with the rest of the code.
-        """
+    def _parse_metrics_event(self, message: Dict[str, Any]) -> SimpleNamespace:
         flat_value = MetricsEventValue(**message)
-        # cloud may be an Enum; derive a stable partition key string
         cloud_part = getattr(flat_value.cloud, "value", str(flat_value.cloud))
         partition_key = f"{flat_value.service}@{cloud_part}"
         return SimpleNamespace(key=partition_key, value=flat_value)
 
     def close(self) -> None:
         super().close()
-        if self.producer:
+        if self._owns_producer and self.producer:
             self.producer.close()

@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    network_mode: host
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    network_mode: host
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_HTTP_PORT=3000
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter
+    container_name: kafka-exporter
+    network_mode: host
+    command: ["--kafka.server=localhost:9092"]
+
+  load-balancer-proxy:
+    network_mode: host
+
+  aws-simulator:
+    ports:
+      - "8001:8001"
+
+  aks-simulator:
+    ports:
+      - "8002:8002"
+
+  digitalocean-simulator:
+    ports:
+      - "8003:8003"

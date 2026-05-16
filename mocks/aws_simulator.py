@@ -3,36 +3,33 @@
 import random
 from mocks.base_simulator import BaseSimulator
 
-
 class AWSSimulator(BaseSimulator):
-    """Simulates AWS EC2/ECS service metrics."""
+    """Simulates AWS EC2/ECS service metrics. High performance under load."""
 
     def __init__(self, service_name: str = "service-cache-aws", service_port: int = 8001):
         super().__init__(service_name, "aws", service_port, service_port)
-        self.latency_baseline = 45  # AWS typically lower latency
-        self.cpu_baseline = 35
-        self.error_rate_baseline = 0.5
 
-    def generate_metrics(self) -> dict:
-        """Generate AWS-specific metrics."""
-        latency = max(10, self.latency_baseline + random.gauss(0, 15))
-        cpu = max(5, min(100, self.cpu_baseline + random.gauss(0, 10)))
-        error_rate = max(0, min(10, self.error_rate_baseline + random.gauss(0, 0.3)))
-        memory = max(20, min(100, random.randint(20, 80)))
+    def generate_metrics(self, active_requests: int) -> dict:
+        """Generate AWS-specific metrics based on active load."""
+        latency = 20.0 + (active_requests * 1.5) + random.gauss(0, 2)
+        cpu = min(100.0, 15.0 + (active_requests * 0.8) + random.gauss(0, 1))
+        
+        if cpu < 80:
+            error_rate = 0.1
+        else:
+            error_rate = 0.1 + ((cpu - 80) * 0.5)
+            
+        memory = min(100.0, 30.0 + (active_requests * 0.2))
 
         return {
-            "latency_ms": latency,
-            "cpu": cpu,
+            "latency_ms": max(1, latency),
+            "cpu": max(1, cpu),
             "memory_percent": memory,
-            "error_rate": error_rate,
-            "requests_per_sec": random.randint(100, 500),
-            "region": random.choice(["us-east-1", "us-west-2", "eu-west-1"]),
+            "error_rate": min(100, error_rate)
         }
-
 
 if __name__ == "__main__":
     import os
-
     port = int(os.getenv("SERVICE_PORT", "8001"))
     simulator = AWSSimulator(service_port=port)
     simulator.run()

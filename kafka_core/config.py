@@ -10,6 +10,8 @@ KEY CLASSES:
 
 TOPICS CONFIGURED:
   - metrics.events (3 partitions): Raw metrics from mock/real services
+  - service.state (3 partitions): Service-agent belief and intent state
+  - topo.decisions (3 partitions): Topology redistribution decisions
   - system.audit.log (1 partition): Audit trail for all actions and decisions
   - policy.decisions (2 partitions): Agent decisions pending approval/execution
   - policy.executions (2 partitions): Execution results of approved policies
@@ -76,7 +78,7 @@ class KafkaConfig:
     PRODUCER_RETRIES = int(os.getenv("KAFKA_PRODUCER_RETRIES", "3"))
 
     # Consumer settings
-    CONSUMER_AUTO_OFFSET_RESET = os.getenv("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "earliest")
+    CONSUMER_AUTO_OFFSET_RESET = os.getenv("KAFKA_CONSUMER_AUTO_OFFSET_RESET", "latest")
     CONSUMER_ENABLE_AUTO_COMMIT = os.getenv("KAFKA_CONSUMER_ENABLE_AUTO_COMMIT", "false").lower() == "true"
 
     # Message encoding
@@ -92,7 +94,7 @@ class KafkaConfig:
         ),
         "service.state": TopicConfig(
             name="service.state",
-            partitions=2,
+            partitions=3,
             retention_ms=7 * 24 * 60 * 60 * 1000,
             partition_key_field="service_id",
         ),
@@ -116,9 +118,9 @@ class KafkaConfig:
         ),
         "topo.decisions": TopicConfig(
             name="topo.decisions",
-            partitions=2,
+            partitions=3,
             retention_ms=7 * 24 * 60 * 60 * 1000,
-            partition_key_field="decision_id",
+            partition_key_field="topo_decision_id",
         ),
     }
 

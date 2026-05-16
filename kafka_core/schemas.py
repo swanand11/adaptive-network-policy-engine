@@ -29,9 +29,18 @@ except ImportError:  # pragma: no cover
                 setattr(self, key, value)
 
         def dict(self):
+            def convert(value):
+                if hasattr(value, "dict"):
+                    return value.dict()
+                if isinstance(value, list):
+                    return [convert(item) for item in value]
+                if isinstance(value, dict):
+                    return {key: convert(item) for key, item in value.items()}
+                return value
+
             result = {}
             for key, value in self.__dict__.items():
-                result[key] = value.dict() if hasattr(value, "dict") else value
+                result[key] = convert(value)
             return result
 
     def Field(default=None, **kwargs):
@@ -49,12 +58,16 @@ class MetricsEventValue(BaseModel):
     Example payload produced by the Prometheus adapter should match this
     model (service, cloud, timestamp, metrics, correlation_id, parent_event_id).
     """
+    event_id: Optional[str] = Field(None, description="Unique event ID")
     service: str = Field(..., description="Service identifier")
     cloud: CloudProvider = Field(..., description="Cloud provider")
     timestamp: datetime = Field(..., description="Event timestamp")
     metrics: Dict[str, Any] = Field(default_factory=dict, description="Metric data (CPU, latency, etc.)")
     correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
     parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+    producer_agent: Optional[str] = Field(None, description="Agent that produced this event")
+    source_offset: Optional[str] = Field(None, description="Kafka source topic/partition/offset")
+    depth: int = Field(0, description="Lineage depth from the adapter event")
 
     class Config:
         use_enum_values = False
@@ -106,6 +119,90 @@ class ServiceStateValue(BaseModel):
 class ServiceState(BaseModel):
     """Complete service state event with key and value."""
     key: str = Field(..., description="Partition key (service_id)")
+    value: ServiceStateValue
+
+
+# ============================================================
+# Service State Topic Schema
+# ============================================================
+class ServiceStateBelief(BaseModel):
+    """Service agent belief snapshot."""
+    latency_ewma: float = Field(..., description="EWMA latency estimate")
+    trend: str = Field(..., description="Recent latency trend")
+    confidence: float = Field(..., description="Belief confidence")
+    status: str = Field(..., description="Service health status")
+
+
+class ServiceStateIntent(BaseModel):
+    """Service agent intent/load target."""
+    current_load: float = Field(..., description="Estimated current load")
+    optimal_load: float = Field(..., description="Target optimal load")
+
+
+class ServiceStateValue(BaseModel):
+    """Value schema for service.state topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
+    service: str = Field(..., description="Service identifier")
+    cloud: CloudProvider = Field(..., description="Cloud provider")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    belief: ServiceStateBelief
+    intent: ServiceStateIntent
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
+    parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+    producer_agent: Optional[str] = Field(None, description="Agent that produced this event")
+    source_offset: Optional[str] = Field(None, description="Kafka source topic/partition/offset")
+    depth: int = Field(0, description="Lineage depth from the adapter event")
+
+    class Config:
+        use_enum_values = False
+
+
+class ServiceState(BaseModel):
+    """Complete service state event."""
+    key: str = Field(..., description="Partition key (service-state event ID)")
+    value: ServiceStateValue
+
+
+# ============================================================
+# Service State Topic Schema
+# ============================================================
+class ServiceStateBelief(BaseModel):
+    """Service agent belief snapshot."""
+    latency_ewma: float = Field(..., description="EWMA latency estimate")
+    trend: str = Field(..., description="Recent latency trend")
+    confidence: float = Field(..., description="Belief confidence")
+    status: str = Field(..., description="Service health status")
+
+
+class ServiceStateIntent(BaseModel):
+    """Service agent intent/load target."""
+    current_load: float = Field(..., description="Estimated current load")
+    optimal_load: float = Field(..., description="Target optimal load")
+
+
+class ServiceStateValue(BaseModel):
+    """Value schema for service.state topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
+    service: str = Field(..., description="Service identifier")
+    cloud: CloudProvider = Field(..., description="Cloud provider")
+    timestamp: datetime = Field(..., description="Event timestamp")
+    belief: ServiceStateBelief
+    intent: ServiceStateIntent
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    correlation_id: Optional[str] = Field(None, description="Correlation ID for tracing")
+    parent_event_id: Optional[str] = Field(None, description="Parent event ID for chaining")
+    producer_agent: Optional[str] = Field(None, description="Agent that produced this event")
+    source_offset: Optional[str] = Field(None, description="Kafka source topic/partition/offset")
+    depth: int = Field(0, description="Lineage depth from the adapter event")
+
+    class Config:
+        use_enum_values = False
+
+
+class ServiceState(BaseModel):
+    """Complete service state event."""
+    key: str = Field(..., description="Partition key (service-state event ID)")
     value: ServiceStateValue
 
 
@@ -194,6 +291,7 @@ class TopoAction(BaseModel):
 
 class TopoDecisionValue(BaseModel):
     """Value schema for topo.decisions topic."""
+    event_id: Optional[str] = Field(None, description="Unique event ID")
     service: str = Field(..., description="Agent/service emitting decision")
     actions: List[TopoAction] = Field(
         ..., description="List of redistribution actions"
@@ -213,6 +311,13 @@ class TopoDecisionValue(BaseModel):
     parent_event_id: Optional[str] = Field(
         None, description="Upstream event reference"
     )
+    producer_agent: Optional[str] = Field(
+        None, description="Agent that produced this event"
+    )
+    source_offset: Optional[str] = Field(
+        None, description="Kafka source topic/partition/offset"
+    )
+    depth: int = Field(0, description="Lineage depth from the adapter event")
 
     class Config:
         use_enum_values = False

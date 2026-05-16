@@ -1,0 +1,18 @@
+FROM openresty/openresty:1.21.4.1-3-alpine
+
+# Install required packages
+RUN apk add --no-cache \
+    lua5.1 \
+    lua5.1-dev
+
+# Copy NGINX configuration
+COPY nginx.conf /usr/local/openresty/nginx/conf/nginx.conf
+
+# Copy Lua scripts
+COPY lua/ /usr/local/openresty/lua/
+
+# Expose port
+EXPOSE 8080
+
+# Start OpenResty
+CMD ["/usr/local/openresty/bin/openresty", "-g", "daemon off;"]
