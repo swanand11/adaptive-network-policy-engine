@@ -93,7 +93,7 @@ class MongoStore:
 
     def get_previous_weights(self) -> Optional[Dict[str, float]]:
         """Get last applied weights from MongoDB or fallback."""
-        if not self.collection:
+        if self.collection is None:
             return self.fallback_store.get_previous_weights()
 
         try:
@@ -121,7 +121,7 @@ class MongoStore:
             "timestamp": datetime.utcnow(),
         }
 
-        if self.collection:
+        if self.collection is not None:
             try:
                 result = self.collection.insert_one(doc)
                 logger.debug(
@@ -135,7 +135,7 @@ class MongoStore:
 
     def close(self) -> None:
         """Close MongoDB connection."""
-        if self.client:
+        if self.client is not None:
             try:
                 self.client.close()
                 logger.info("MongoDB connection closed")
