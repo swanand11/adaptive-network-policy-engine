@@ -233,15 +233,19 @@ class ParallelServiceAgentRunner(ConsumerRebalanceListener):
                 return
 
             try:
-                self.consumer.commit(
-                    {
-                        __import__("kafka").TopicPartition(
-                            topic, partition
-                        ): __import__("kafka").structs.OffsetAndMetadata(offset + 1)
-                    }
-                )
+                commit_payload = {
+                    __import__("kafka").TopicPartition(
+                        topic, partition
+                    ): __import__("kafka").structs.OffsetAndMetadata(offset + 1, "")
+                }
+                self.consumer.commit(commit_payload)
             except KafkaError as e:
-                logger.error(f"Failed to commit offset {offset} for {topic}[{partition}]: {e}")
+                logger.error(
+                    f"Failed to commit offset for group '{self.group_id}' - "
+                    f"topic: {topic}, partition: {partition}, offset: {offset}. "
+                    f"Error: {e}. Payload: {commit_payload}",
+                    exc_info=True
+                )
 
         return commit_offset
 

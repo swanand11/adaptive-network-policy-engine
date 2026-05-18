@@ -1,0 +1,58 @@
+@import 'tailwindcss/base';
+@import 'tailwindcss/components';
+@import 'tailwindcss/utilities';
+
+@layer base {
+  body {
+    @apply bg-dark text-white font-inter;
+    background-image: 
+      radial-gradient(circle at 15% 50%, rgba(112, 0, 255, 0.15), transparent 25%),
+      radial-gradient(circle at 85% 30%, rgba(0, 240, 255, 0.15), transparent 25%);
+    background-attachment: fixed;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-outfit font-bold;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-panel backdrop-blur-glass border border-border rounded-2xl p-6 shadow-2xl;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .glass-panel::before {
+    content: '';
+    @apply absolute top-0 left-0 right-0 h-px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+  }
+
+  .status-dot {
+    @apply w-2 h-2 bg-good rounded-full;
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 230, 118, 0.7); }
+    70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(0, 230, 118, 0); }
+    100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 230, 118, 0); }
+  }
+
+  .gradient-text {
+    @apply bg-gradient-to-r from-accent-primary to-accent-secondary bg-clip-text text-transparent;
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 bg-accent-secondary text-white rounded-lg font-outfit font-bold uppercase text-sm hover:opacity-90 transition-opacity;
+  }
+
+  .btn-secondary {
+    @apply px-4 py-2 bg-accent-primary text-dark rounded-lg font-outfit font-bold uppercase text-sm hover:opacity-90 transition-opacity;
+  }
+
+  .btn-danger {
+    @apply px-4 py-2 bg-bad text-white rounded-lg font-outfit font-bold uppercase text-sm hover:opacity-90 transition-opacity;
+  }
+}

@@ -54,7 +54,12 @@ class InMemoryStore:
 class MongoStore:
     """MongoDB-backed store for governance state with in-memory fallback."""
 
-    def __init__(self, mongo_uri: str, db_name: str = "governance", collection_name: str = "state"):
+    def __init__(
+        self,
+        mongo_uri: str,
+        db_name: str = "adaptive_network_policy_engine",
+        collection_name: str = "governance_state",
+    ):
         """
         Initialize MongoDB store.
 
@@ -93,15 +98,31 @@ class MongoStore:
 
     def get_previous_weights(self) -> Optional[Dict[str, float]]:
         """Get last applied weights from MongoDB or fallback."""
-        if not self.collection:
+        if self.collection is None:
+            logger.warning("MongoStore unavailable; reading previous weights from in-memory fallback")
             return self.fallback_store.get_previous_weights()
 
         try:
-            doc = self.collection.find_one(sort=[("timestamp", -1)])
+            doc = self.collection.find_one(
+                {"type": "weights"},
+                sort=[("timestamp", -1)],
+            )
+            if doc is None:
+                # Backward compatibility: legacy documents without `type`.
+                doc = self.collection.find_one(
+                    {"weights": {"$exists": True}},
+                    sort=[("timestamp", -1)],
+                )
+
             if doc:
                 weights = doc.get("weights")
-                logger.debug(f"MongoStore retrieved weights: decision_id={doc.get('decision_id')}")
+                logger.info(
+                    "Retrieved previous weights document: decision_id=%s timestamp=%s",
+                    doc.get("decision_id"),
+                    doc.get("timestamp"),
+                )
                 return weights
+            logger.info("No previous weights document found in MongoDB")
             return None
         except Exception as e:
             logger.error(f"MongoStore read error: {e}. Falling back to in-memory.", exc_info=False)
@@ -115,17 +136,20 @@ class MongoStore:
     ) -> None:
         """Save applied weights to MongoDB and fallback cache."""
         doc = {
+            "type": "weights",
             "decision_id": decision_id,
             "correlation_id": correlation_id,
             "weights": weights,
             "timestamp": datetime.utcnow(),
         }
 
-        if self.collection:
+        if self.collection is not None:
             try:
                 result = self.collection.insert_one(doc)
-                logger.debug(
-                    f"MongoStore saved weights: decision_id={decision_id}, inserted_id={result.inserted_id}"
+                logger.info(
+                    "Saved weights document: decision_id=%s inserted_id=%s",
+                    decision_id,
+                    result.inserted_id,
                 )
             except Exception as e:
                 logger.error(f"MongoStore write error: {e}. Falling back to in-memory.", exc_info=False)

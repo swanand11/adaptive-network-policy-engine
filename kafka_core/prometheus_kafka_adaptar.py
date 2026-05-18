@@ -65,36 +65,28 @@ except ImportError as e:
     print("Make sure kafka package is in PYTHONPATH")
 
 
-ENDPOINTS = {
-    "aws": {
-        "url": "http://aws-simulator:8001/metrics",
-        "cloud": CloudProvider.AWS,
-        "service_id": "service-cache-aws",
-        "partition": 0,
-    },
-    "aks": {
-        "url": "http://aks-simulator:8002/metrics",
-        "cloud": CloudProvider.AZURE,
-        "service_id": "service-cache-aks",
-        "partition": 1,
-    },
-    "droplet": {
-        "url": "http://digitalocean-simulator:8003/metrics",
-        "cloud": CloudProvider.DIGITALOCEAN,
-        "service_id": "service-cache-droplet",
-        "partition": 2,
+# Convert ENDPOINTS_CONFIG to use CloudProvider enums
+ENDPOINTS = {}
+for name, config in ENDPOINTS_CONFIG.items():
+    cloud_str = config.get("cloud", "").lower()  # Convert to lowercase
+    if cloud_str == "aws":
+        cloud_provider = CloudProvider.AWS
+    elif cloud_str == "azure":
+        cloud_provider = CloudProvider.AZURE
+    elif cloud_str == "digitalocean":
+        cloud_provider = CloudProvider.DIGITALOCEAN
+    else:
+        cloud_provider = CloudProvider.AWS  # Default fallback
+    
+    ENDPOINTS[name] = {
+        "url": config["url"],
+        "cloud": cloud_provider,
+        "service_id": config["service_id"],
+        "partition": config.get("partition", 0),
     }
-}
 
-# Polling interval in seconds
-POLL_INTERVAL = 5  # Poll every 5 seconds (matches Prometheus refresh)
-
-# Request timeout
-REQUEST_TIMEOUT = 5  # seconds
-
-# Retry configuration for resilience
-MAX_RETRIES = 3
-BACKOFF_FACTOR = 0.5
+# Note: POLL_INTERVAL, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_FACTOR
+# are imported from prometheus_adapter_config above
 
 
 
@@ -199,15 +191,11 @@ class MetricsNormalizer:
             'timestamp': datetime.now().isoformat()
         }
         
-        # Extract request latency (summary metric: sum/count = avg)
-        if 'request_latency_seconds_sum' in parsed_metrics and 'request_latency_seconds_count' in parsed_metrics:
+        # Extract request latency (gauge)
+        if 'latency_ms' in parsed_metrics:
             try:
-                latency_sum = parsed_metrics['request_latency_seconds_sum'][0]['value']
-                latency_count = parsed_metrics['request_latency_seconds_count'][0]['value']
-                if latency_count > 0:
-                    avg_latency_sec = latency_sum / latency_count
-                    normalized['request_latency_ms'] = avg_latency_sec * 1000
-            except (IndexError, KeyError, ZeroDivisionError) as e:
+                normalized['request_latency_ms'] = parsed_metrics['latency_ms'][0]['value']
+            except (IndexError, KeyError) as e:
                 logger.warning(f"Could not extract latency: {e}")
         
         # Extract request count
@@ -341,12 +329,14 @@ class PrometheusMetricsAdapter:
                 normalized = self.normalizer.normalize(parsed_metrics)
                 logger.debug(f"Normalized metrics for {endpoint_name}: {normalized}")
                 
-                partition_key = service_key(config["service_id"], config["cloud"].value)
+                # Get cloud value - handle both enum and string
+                cloud_value = config["cloud"].value if hasattr(config["cloud"], 'value') else str(config["cloud"]).lower()
+                partition_key = service_key(config["service_id"], cloud_value)
                 event = MetricsEvent(
                     key=partition_key,
                     value=MetricsEventValue(
                         service=config['service_id'],
-                        cloud=config['cloud'],
+                        cloud=cloud_value,  # Pass the lowercase string value
                         timestamp=datetime.now(),
                         metrics=normalized,
                         correlation_id=f"prometheus-{endpoint_name}-{datetime.now().timestamp()}"

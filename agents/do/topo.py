@@ -314,8 +314,23 @@ class TopographyAgent(KafkaConsumerTemplate):
                 self.latest_depth = int(value.get("depth") or 0)
             else:
                 state = ServiceStateValue(**message)
-                if state.producer_agent and state.producer_agent.startswith("topography"):
-                    logger.warning("Dropping recursive topology-produced service.state event_id=%s", state.event_id)
+                state_dict = state.model_dump() if hasattr(state, "model_dump") else state.dict()
+                producer_agent = message.get("producer_agent") or state_dict.get("producer_agent")
+                event_id = message.get("event_id") or state_dict.get("event_id")
+                source_offset_from_payload = message.get("source_offset") or state_dict.get("source_offset")
+                depth = message.get("depth") if message.get("depth") is not None else state_dict.get("depth")
+
+                if producer_agent is None:
+                    logger.warning(
+                        "Missing producer_agent field in service.state payload",
+                        extra={
+                            "service": state.service,
+                            "correlation_id": state.correlation_id,
+                            "available_fields": sorted(list(state_dict.keys())),
+                        },
+                    )
+                elif producer_agent.startswith("topography"):
+                    logger.warning("Dropping recursive topology-produced service.state event_id=%s", event_id)
                     return True
                 service_id = state.service
                 intent = state.intent
@@ -326,10 +341,10 @@ class TopographyAgent(KafkaConsumerTemplate):
                     "confidence": belief.get("confidence") if isinstance(belief, dict) else belief.confidence,
                 }
                 self.latest_correlation_id = state.correlation_id
-                self.latest_parent_event_id = state.event_id or state.parent_event_id
-                self.latest_event_id = state.event_id
-                self.latest_source_offset = source_offset or state.source_offset
-                self.latest_depth = int(state.depth or 0)
+                self.latest_parent_event_id = event_id or state.parent_event_id
+                self.latest_event_id = event_id
+                self.latest_source_offset = source_offset or source_offset_from_payload
+                self.latest_depth = int(depth or 0)
             logger.debug(f"Updated state for {service_id}: {self.global_state[service_id]}")
 
             current_time = time.time()

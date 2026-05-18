@@ -58,8 +58,7 @@ LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 
 # Metrics to extract (others are ignored)
 METRICS_TO_EXTRACT = [
-    'request_latency_seconds_sum',
-    'request_latency_seconds_count',
+    'latency_ms',
     'request_count_total',
     'cpu_usage_percent',
     'memory_usage_percent',
@@ -68,7 +67,7 @@ METRICS_TO_EXTRACT = [
 
 # Metric field mappings (prometheus_name -> normalized_name)
 METRIC_FIELD_MAPPING = {
-    'request_latency_seconds': 'request_latency_ms',
+    'latency_ms': 'request_latency_ms',
     'request_count_total': 'request_count',
     'cpu_usage_percent': 'cpu_usage_percent',
     'memory_usage_percent': 'memory_usage_percent',

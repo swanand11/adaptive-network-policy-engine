@@ -218,6 +218,13 @@ class GovernanceAgent(KafkaConsumerTemplate):
 
         self.producer.send("policy.decisions", governance_event)
 
+        # Persist selected weights so next batch can use them as KL baseline.
+        self.store.save_applied_weights(
+            W_best,
+            governance_decision_id,
+            self.root_correlation_id,
+        )
+
         logger.info(
             f"Published governance decision: governance_id={governance_decision_id}, "
             f"selected_topo={best_decision_id}, D_best={D_best:.6f}, risk_level={risk_level.value}, "

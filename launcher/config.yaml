@@ -1,0 +1,154 @@
+# Launcher Configuration
+# Multi-Agent Multi-Cloud Network Policy Orchestrator
+
+system:
+  name: "Multi-Cloud Policy Orchestrator"
+  version: "1.0.0"
+  environment: "local"  # local | production
+
+infrastructure:
+  kafka:
+    enabled: true
+    bootstrap_servers: "localhost:9092"
+    command: "docker compose up -d --remove-orphans kafka zookeeper"
+    health_check: "localhost:9092"
+    startup_delay: 10
+  
+  prometheus:
+    enabled: true
+    url: "http://localhost:9090"
+    command: "docker compose up -d --remove-orphans prometheus"
+    health_check: "localhost:9090/-/healthy"
+    startup_delay: 5
+  
+  redis:
+    enabled: true
+    host: "localhost"
+    port: 6379
+    command: "docker compose up -d --remove-orphans redis"
+    health_check: "localhost:6379"
+    startup_delay: 3
+
+simulators:
+  aws:
+    enabled: true
+    command: "python3 -m mocks.aws_simulator"
+    port: 8001
+    health_check: "localhost:8001/metrics"
+    restart_on_failure: true
+    max_restarts: 3
+  
+  azure:
+    enabled: true
+    command: "python3 -m mocks.aks_simulator"
+    port: 8002
+    health_check: "localhost:8002/metrics"
+    restart_on_failure: true
+    max_restarts: 3
+  
+  digitalocean:
+    enabled: true
+    command: "python3 -m mocks.dodroplets_simulator"
+    port: 8003
+    health_check: "localhost:8003/metrics"
+    restart_on_failure: true
+    max_restarts: 3
+
+agents:
+  prometheus_adapter:
+    enabled: true
+    command: "python3 -m kafka_core.prometheus_kafka_adaptar"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "prometheus", "simulator-aws", "simulator-azure", "simulator-digitalocean"]
+  
+  service_agent_1:
+    enabled: true
+    command: "python3 -m runners.service_agent_runner"
+    env:
+      SERVICE_ID: "service-cache-aws"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "prometheus_adapter"]
+  
+  service_agent_2:
+    enabled: true
+    command: "python3 -m runners.service_agent_runner"
+    env:
+      SERVICE_ID: "service-db"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "prometheus_adapter"]
+  
+  service_agent_3:
+    enabled: true
+    command: "python3 -m runners.service_agent_runner"
+    env:
+      SERVICE_ID: "service-cache"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "prometheus_adapter"]
+  
+  topology_aws:
+    enabled: true
+    command: "python3 -m runners.topo_agent_aws_runner"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "service_agent_1", "service_agent_2", "service_agent_3"]
+  
+  topology_aks:
+    enabled: true
+    command: "python3 -m runners.topo_agent_aks_runner"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "service_agent_1", "service_agent_2", "service_agent_3"]
+  
+  topology_do:
+    enabled: true
+    command: "python3 -m runners.topo_agent_do_runner"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "service_agent_1", "service_agent_2", "service_agent_3"]
+  
+  governance_agent:
+    enabled: true
+    command: "python3 -m runners.governance_agent_runner"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "topology_aws", "topology_aks", "topology_do"]
+
+consumers:
+  nginx_weight_consumer:
+    enabled: true
+    command: "python3 -m consumers.nginx_weight_consumer"
+    restart_on_failure: true
+    max_restarts: 5
+    depends_on: ["kafka", "redis", "governance_agent"]
+
+hitl:
+  enabled: true
+  command: "python3 -m hitl.api"
+  port: 8080
+  health_check: "localhost:8080/health"
+  depends_on: ["kafka", "governance_agent"]
+
+traffic:
+  generator:
+    enabled: true
+    command: "python3 -m traffic_generator.generator --profile moderate --duration 300"
+    requests_per_second: 10
+    depends_on: ["simulator-aws", "simulator-azure", "simulator-digitalocean"]
+
+backend:
+  api:
+    enabled: true
+    command: "python3 -m backend.api"
+    port: 8000
+    health_check: "localhost:8000/health"
+    depends_on: ["kafka", "redis"]
+
+monitoring:
+  websocket_port: 8765
+  sse_port: 8766
+  metrics_interval: 5  # seconds
+  log_buffer_size: 1000
