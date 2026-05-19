@@ -43,7 +43,7 @@ from kafka_core.producer_base import KafkaProducerTemplate
 from kafka_core.schemas import ServiceStateValue, TopoDecision, TopoDecisionValue
 from kafka_core.enums import PolicyStatus, RiskLevel
 from kafka_core.schemas import TopoAction
-from kafka_core.pipeline import service_partition
+from kafka_core.pipeline import service_partition, SERVICES
 
 
 logging.basicConfig(level=logging.INFO)
@@ -258,6 +258,8 @@ class TopographyAgent(KafkaConsumerTemplate):
         if consumer:
             self.consumer = consumer
         else:
+            if partitions is None:
+                partitions = {"service.state": [svc.partition for svc in SERVICES]}
             super().__init__(
                 topics=["service.state"],
                 group_id=group_id or f"topography-{service_id}",
