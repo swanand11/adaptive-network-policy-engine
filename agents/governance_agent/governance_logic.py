@@ -23,6 +23,22 @@ MIN_WEIGHT = 0.05
 THRESHOLD = 0.03
 
 
+def map_to_csp(name: str) -> Optional[str]:
+    if not name:
+        return None
+    name = str(name).lower()
+    if "aws" in name or "amazon" in name:
+        return "aws"
+    if "aks" in name or "azure" in name or "db" in name:
+        return "aks"
+    if "do" in name or "digitalocean" in name or "droplet" in name or "service-cache" in name:
+        # Avoid false positives: "service-cache-aws" has "aws" which is handled above.
+        # But if "service-cache" is exactly or starts with service-cache and is not aws, it maps to do.
+        if "service-cache-aws" in name:
+            return "aws"
+        return "do"
+    return None
+
 def actions_to_weights(
     actions: List[Dict],
     csp_set: List[str],
@@ -49,9 +65,12 @@ def actions_to_weights(
     outgoing = {csp: 0.0 for csp in csp_set}
 
     for action in actions:
-        from_csp = action.get("from_csp")
-        to_csp = action.get("to_csp")
+        from_raw = action.get("from_csp")
+        to_raw = action.get("to_csp")
         intensity = action.get("intensity", 0.0)
+
+        from_csp = map_to_csp(from_raw)
+        to_csp = map_to_csp(to_raw)
 
         if from_csp in outgoing:
             outgoing[from_csp] += intensity
@@ -79,7 +98,7 @@ def actions_to_weights(
     else:
         weights = {csp: weights[csp] / total for csp in csp_set}
 
-    logger.debug(f"actions_to_weights: {len(actions)} actions → {weights}")
+    logger.info(f"actions_to_weights: converted {actions} to flows incoming={incoming}, outgoing={outgoing} -> weights={weights}")
     return weights
 
 

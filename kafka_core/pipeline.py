@@ -34,14 +34,14 @@ SERVICES = (
     ),
     PipelineService(
         name="aks",
-        service_id="service-cache-aks",
+        service_id="service-db",
         cloud=CloudProvider.AZURE,
         partition=1,
         metrics_url="http://127.0.0.1:8002/metrics",
     ),
     PipelineService(
         name="do",
-        service_id="service-cache-droplet",
+        service_id="service-cache",
         cloud=CloudProvider.DIGITALOCEAN,
         partition=2,
         metrics_url="http://127.0.0.1:8003/metrics",

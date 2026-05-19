@@ -138,7 +138,7 @@ services:
       - kafka
       - load-balancer-proxy
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     networks:
       - app-network
 
@@ -152,7 +152,7 @@ services:
     depends_on:
       - kafka
     environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     networks:
       - app-network
 
@@ -198,6 +198,7 @@ services:
     container_name: prometheus-adapter
 
     environment:
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
       PROMETHEUS_AWS_URL: "http://aws-simulator:8001/metrics"
       PROMETHEUS_AKS_URL: "http://aks-simulator:8002/metrics"
       PROMETHEUS_DO_URL: "http://digitalocean-simulator:8003/metrics"

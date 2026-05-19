@@ -40,7 +40,7 @@ class ExecutionConsumer(KafkaConsumerTemplate):
             topics=["policy.decisions"],
             group_id="execution_consumer_group"
         )
-        self.proxy_url = "http://load-balancer-proxy:8080/update_weights"
+        self.proxy_url = "http://load-balancer-proxy:9000/update_weights"
 
     def process_message(self, topic: str, message: Dict[str, Any]) -> bool:
         """
@@ -61,10 +61,11 @@ class ExecutionConsumer(KafkaConsumerTemplate):
             value = message.get("value", {})
             metadata = value.get("metadata", {})
 
-            # Extract weights from metadata
-            aws_wi = metadata.get("aws_wi")
-            aks_wi = metadata.get("aks_wi")
-            do_wi = metadata.get("do_wi")
+            # Extract weights robustly from flat or nested format
+            weights = metadata.get("weights") or {}
+            aws_wi = metadata.get("aws_wi") or weights.get("aws")
+            aks_wi = metadata.get("aks_wi") or weights.get("aks")
+            do_wi = metadata.get("do_wi") or weights.get("do")
 
             if aws_wi is None or aks_wi is None or do_wi is None:
                 logger.warning(f"Missing weights in message: {message}")

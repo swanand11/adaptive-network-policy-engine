@@ -13,8 +13,8 @@ gnome-terminal --title="02_Prometheus_Adapter" -- bash -c "python3 02_prometheus
 echo "Launching 03_service_agents..."
 gnome-terminal --title="03_Service_Agents" -- bash -c "python3 03_service_agents.py; exec bash"
 
-echo "Launching 04_topo_agent_aws..."
-gnome-terminal --title="04_Topo_Agent_AWS" -- bash -c "python3 04_topo_agent_aws.py; exec bash"
+echo "Launching 04_topo_agent..."
+gnome-terminal --title="04_Topo_Agent" -- bash -c "python3 04_topo_agent.py; exec bash"
 
 echo "Launching 05_governance_agent..."
 gnome-terminal --title="05_Governance_Agent" -- bash -c "python3 05_governance_agent.py; exec bash"
@@ -22,7 +22,10 @@ gnome-terminal --title="05_Governance_Agent" -- bash -c "python3 05_governance_a
 echo "Launching 06_execution_consumer..."
 gnome-terminal --title="06_Execution_Consumer" -- bash -c "python3 06_execution_consumer.py; exec bash"
 
-echo "Launching 07_websocket_bridge (UI Integration)..."
-gnome-terminal --title="07_WebSocket_Bridge" -- bash -c "python3 07_websocket_bridge.py; exec bash"
+echo "Launching 08_traffic_demo..."
+gnome-terminal --title="08_Traffic_Demo" -- bash -c "python3 08_traffic_demo.py; exec bash"
 
-echo "All pipeline stages and UI bridge launched in separate terminals!"
+echo "Launching 09_governance_flask_api (REST API for UI)..."
+gnome-terminal --title="09_Governance_Flask_API" -- bash -c "cd .. && python3 -m backend.governance_flask_api; exec bash"
+
+echo "All pipeline stages, backend APIs, and traffic generator launched in separate terminals!"

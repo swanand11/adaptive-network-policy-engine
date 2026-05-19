@@ -38,7 +38,7 @@ python3 03_service_agents.py
 
 **Terminal 4 (Topology Agent):**
 ```bash
-python3 04_topo_agent_aws.py
+python3 04_topo_agent.py
 ```
 *This consumes `service.state` and publishes `topo.decisions`.*
 
@@ -54,8 +54,12 @@ python3 06_execution_consumer.py
 ```
 *This consumes `policy.decisions` and executes them against the load balancer.*
 
-**Terminal 7 (WebSocket UI Bridge):**
+**Terminal 7 (WebSocket UI Bridge / Backend API):**
+*Note: Refer to `backend/api.py` as it runs the complete FastAPI WebSocket server now.*
+
+**Terminal 8 (Traffic Demo):**
 ```bash
-python3 07_websocket_bridge.py
+python3 08_traffic_demo.py
 ```
-*This streams all the Kafka events directly to your React Frontend so everything reflects in the UI.*
+*This hits the load balancer with background traffic, spikes load on AWS, and showcases closed-loop proactive policy orchestration in action!*
+

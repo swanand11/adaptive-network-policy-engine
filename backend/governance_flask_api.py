@@ -417,6 +417,13 @@ class KafkaPollingConsumer(threading.Thread):
                 "approval_time": None,
                 "status": "PENDING",
                 "payload": event.get("payload", {}),
+                "decision": {
+                    "service": event.get("service", "unknown"),
+                    "decision": event.get("payload", {}).get("decision") or event.get("action", "unknown"),
+                    "risk_level": str(event.get("severity", "high")).lower(),
+                    "status": "pending",
+                    "metadata": event.get("payload", {}).get("metadata") or {},
+                }
             }
         )
 
@@ -439,7 +446,34 @@ class GovernanceProducer:
         if not topic or self._producer is None:
             return
         try:
+            # Publish legacy format to governance.approved
             self._producer.send(topic, item)
+            
+            if decision == "APPROVED":
+                # Extract original decision value from payload
+                orig_payload = item.get("payload") or {}
+                if orig_payload:
+                    # Update status to APPROVED and add approval metadata
+                    orig_payload = dict(orig_payload)
+                    orig_payload["status"] = "APPROVED"
+                    if "metadata" not in orig_payload:
+                        orig_payload["metadata"] = {}
+                    orig_payload["metadata"] = dict(orig_payload["metadata"])
+                    orig_payload["metadata"]["approved_by"] = item.get("approver", "operator")
+                    orig_payload["metadata"]["approval_note"] = item.get("reasoning", "")
+                    orig_payload["metadata"]["approved_at"] = item.get("approval_time")
+                    
+                    # Wrap in PolicyDecision structure (key/value) for standard consumers
+                    decision_id = orig_payload.get("decision_id") or item.get("id") or "unknown"
+                    wrapped = {
+                        "key": decision_id,
+                        "value": orig_payload
+                    }
+                    
+                    logger.info("Publishing approved decision to policy.approved and policy.decisions: %s", decision_id)
+                    self._producer.send("policy.approved", wrapped)
+                    self._producer.send("policy.decisions", wrapped)
+            
             self._producer.flush(timeout=2)
         except Exception:
             logger.exception("Failed publishing governance decision to %s", topic)

@@ -24,8 +24,10 @@ def start_all_runners():
 
     def _start(module_name: str):
         cmd = [sys.executable, "-m", module_name]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         # inherit stdio so logs appear in this terminal
-        return subprocess.Popen(cmd, env=os.environ.copy())
+        return subprocess.Popen(cmd, env=env)
 
     # start subprocess for each runner
     for m in RUNNERS:
