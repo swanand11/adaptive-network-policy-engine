@@ -281,7 +281,7 @@ class TopographyAgent(KafkaConsumerTemplate):
         self.max_decisions_per_correlation = 10
 
         # Hyper-parameters
-        self.alpha       = 0.35   # fraction of |pressure| available for redistribution
+        self.alpha       = 1.5   # fraction of |pressure| available for redistribution
         self.beta        = 0.18   # Tikhonov weight (penalises large individual flows)
         self.temperature = 1.2    # entropy barrier scale (anneals across decisions)
         self.gamma       = 0.05   # temperature decay rate per published decision

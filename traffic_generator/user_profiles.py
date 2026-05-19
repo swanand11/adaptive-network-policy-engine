@@ -97,4 +97,9 @@ PROFILES = {
         base_rps=10.0,
         pattern=TrafficPattern.RANDOM
     ),
+    "high_risk": UserProfile(
+        name="High Risk Event",
+        base_rps=200.0, # Massive RPS to trigger severe degradation and weight changes
+        pattern=TrafficPattern.BURST
+    ),
 }

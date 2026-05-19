@@ -43,6 +43,8 @@ class TrafficDemo:
                     # Map Azure to aks for display consistency
                     if cloud == "azure":
                         cloud = "aks"
+                    elif cloud == "digitalocean":
+                        cloud = "do"
                     self.stats[cloud] += 1
                     self.total_baseline_sent += 1
                 else:
@@ -148,20 +150,30 @@ class TrafficDemo:
         print("Observe how baseline user traffic is actively shifted away from the overloaded AWS node!")
         await asyncio.sleep(25)
 
-        # --- Phase 4: Recovery ---
-        self.phase = "Phase 4: Cooldown & Recovery"
-        self.print_header("PHASE 4: SURGE ENDED - COOLING DOWN AWS", YELLOW)
-        print("Stopping AWS surge. AWS metrics will recover. Policy engine should dynamically restore balance.")
-        self.surge_rate = 0
-        self.surge_target = None
-        await asyncio.sleep(20)
-
-        # Teardown
-        self.running = False
-        baseline_task.cancel()
-        surge_task.cancel()
-        reporter_task.cancel()
-        self.print_header("DEMO COMPLETE - POLICY ENGINE STABLE", BOLD + GREEN)
+        # --- Phase 5: Continuous Load with Random High-Risk Spikes ---
+        self.phase = "Phase 5: Continuous Operation (Ctrl+C to stop)"
+        self.print_header("PHASE 5: CONTINUOUS RUN - PRESS CTRL+C TO STOP", BLUE)
+        print("Continuing to send baseline traffic indefinitely.")
+        print("Occasionally, massive traffic spikes will occur to trigger HITL approval events.")
+        
+        import random
+        while self.running:
+            await asyncio.sleep(20)
+            target = random.choice(["aws", "aks", "do"])
+            self.phase = f"Surge: Massive spike on {target.upper()}"
+            self.print_header(f"RANDOM EVENT: HIGH RISK SURGE ON {target.upper()}", RED)
+            print(f"Simulating extreme surge on {target.upper()} to force high KL divergence and HITL approval...")
+            self.surge_target = target
+            self.surge_rate = 60  # Extreme surge to break thresholds
+            
+            await asyncio.sleep(20)
+            
+            self.phase = "Recovery Phase"
+            self.print_header("RANDOM EVENT OVER - COOLING DOWN", YELLOW)
+            self.surge_rate = 0
+            self.surge_target = None
+            await asyncio.sleep(20)
+            self.phase = "Phase 5: Continuous Operation"
 
 if __name__ == "__main__":
     demo = TrafficDemo()

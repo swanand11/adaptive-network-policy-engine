@@ -25,12 +25,27 @@ local rand = math.random(1, total_weight)
 
 -- Select upstream based on weights using cumulative distribution
 local upstream
-if rand <= aws_weight then
-    upstream = "aws"
-elseif rand <= (aws_weight + azure_weight) then
-    upstream = "azure"
+local target_header = ngx.req.get_headers()["X-CSP-Target"]
+
+if target_header and target_header ~= "" then
+    -- Direct surge traffic to the specific target
+    if target_header == "aws" or target_header == "azure" or target_header == "digitalocean" then
+        upstream = target_header
+    elseif target_header == "aks" then
+        upstream = "azure"
+    elseif target_header == "do" then
+        upstream = "digitalocean"
+    else
+        upstream = target_header
+    end
 else
-    upstream = "digitalocean"
+    if rand <= aws_weight then
+        upstream = "aws"
+    elseif rand <= (aws_weight + azure_weight) then
+        upstream = "azure"
+    else
+        upstream = "digitalocean"
+    end
 end
 
 -- Log the selection (for debugging)
