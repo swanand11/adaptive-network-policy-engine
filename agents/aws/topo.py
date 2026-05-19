@@ -258,8 +258,6 @@ class TopographyAgent(KafkaConsumerTemplate):
         if consumer:
             self.consumer = consumer
         else:
-            if partitions is None:
-                partitions = {"service.state": [svc.partition for svc in SERVICES]}
             super().__init__(
                 topics=["service.state"],
                 group_id=group_id or f"topography-{service_id}",

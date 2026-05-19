@@ -58,14 +58,26 @@ class ExecutionConsumer(KafkaConsumerTemplate):
                 logger.warning(f"Unexpected topic: {topic}")
                 return True
 
-            value = message.get("value", {})
-            metadata = value.get("metadata", {})
+            # Support both wrapped and direct formats
+            payload = message.get("value") if isinstance(message.get("value"), dict) else message
+            metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+
+            risk_level = str(payload.get("risk_level") or metadata.get("risk_level") or "low").lower()
+            status = str(payload.get("status") or metadata.get("status") or "pending").lower()
+
+            # High-risk decisions MUST be approved before application
+            if risk_level == "high" and status != "approved":
+                logger.info(
+                    f"Skipping high-risk decision pending human approval: "
+                    f"risk={risk_level}, status={status}, id={payload.get('key') or payload.get('decision_id') or 'unknown'}"
+                )
+                return True
 
             # Extract weights robustly from flat or nested format
-            weights = metadata.get("weights") or {}
-            aws_wi = metadata.get("aws_wi") or weights.get("aws")
-            aks_wi = metadata.get("aks_wi") or weights.get("aks")
-            do_wi = metadata.get("do_wi") or weights.get("do")
+            weights = metadata.get("weights") or payload.get("weights") or {}
+            aws_wi = metadata.get("aws_wi") or weights.get("aws") or payload.get("aws_wi")
+            aks_wi = metadata.get("aks_wi") or weights.get("aks") or payload.get("aks_wi")
+            do_wi = metadata.get("do_wi") or weights.get("do") or payload.get("do_wi")
 
             if aws_wi is None or aks_wi is None or do_wi is None:
                 logger.warning(f"Missing weights in message: {message}")

@@ -370,7 +370,7 @@ class KafkaPollingConsumer(threading.Thread):
                             event = normalize_event(tp.topic, payload)
                             self.cache.append_topic(tp.topic, event)
                             self._maybe_enqueue_highrisk(event)
-                            if tp.topic == "policy.approved":
+                            if tp.topic == "policy.approved" or tp.topic == "policy.decisions":
                                 self.cache.add_execution_result(event)
                     self.cache.expire_old()
 

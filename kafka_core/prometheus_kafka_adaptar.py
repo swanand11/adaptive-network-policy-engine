@@ -190,8 +190,16 @@ class MetricsNormalizer:
             'memory_usage_percent': None,
             'timestamp': datetime.now().isoformat()
         }
-        # Derive avg latency from Prometheus summary
-        if (
+        # Extract latency_ms Gauge if available
+        if 'latency_ms' in parsed_metrics:
+            try:
+                val = parsed_metrics['latency_ms'][0]['value']
+                normalized['request_latency_ms'] = val
+                normalized['latency_ms'] = val
+            except (IndexError, KeyError) as e:
+                logger.warning(f"Could not extract latency_ms: {e}")
+        # Otherwise derive avg latency from Prometheus summary
+        elif (
             'request_latency_seconds_sum' in parsed_metrics and
             'request_latency_seconds_count' in parsed_metrics
         ):
@@ -200,10 +208,13 @@ class MetricsNormalizer:
                 latency_count = parsed_metrics['request_latency_seconds_count'][0]['value']
 
                 if latency_count > 0:
-                    normalized['latency_ms'] = (latency_sum / latency_count) * 1000
+                    val = (latency_sum / latency_count) * 1000
+                    normalized['request_latency_ms'] = val
+                    normalized['latency_ms'] = val
 
             except (IndexError, KeyError, ZeroDivisionError) as e:
                 logger.warning(f"Could not derive latency_ms: {e}")
+
                 
         # Extract request count
         if 'request_count_total' in parsed_metrics:
