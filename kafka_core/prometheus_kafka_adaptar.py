@@ -59,20 +59,34 @@ try:
     from .schemas import MetricsEvent, MetricsEventValue
     from .producer_base import KafkaProducerTemplate
     from .enums import CloudProvider
+    from .pipeline import service_key
 except ImportError as e:
     print(f"Warning: Could not import Kafka modules: {e}")
     print("Make sure kafka package is in PYTHONPATH")
 
 
-ENDPOINTS = {
-    endpoint_name: {
-        "url": endpoint_config["url"],
-        "cloud": CloudProvider(endpoint_config["cloud"].lower()),
-        "service_id": endpoint_config["service_id"],
-        "partition": endpoint_config["partition"],
+# Convert ENDPOINTS_CONFIG to use CloudProvider enums
+ENDPOINTS = {}
+for name, config in ENDPOINTS_CONFIG.items():
+    cloud_str = config.get("cloud", "").lower()  # Convert to lowercase
+    if cloud_str == "aws":
+        cloud_provider = CloudProvider.AWS
+    elif cloud_str == "azure":
+        cloud_provider = CloudProvider.AZURE
+    elif cloud_str == "digitalocean":
+        cloud_provider = CloudProvider.DIGITALOCEAN
+    else:
+        cloud_provider = CloudProvider.AWS  # Default fallback
+    
+    ENDPOINTS[name] = {
+        "url": config["url"],
+        "cloud": cloud_provider,
+        "service_id": config["service_id"],
+        "partition": config.get("partition", 0),
     }
-    for endpoint_name, endpoint_config in ENDPOINTS_CONFIG.items()
-}
+
+# Note: POLL_INTERVAL, REQUEST_TIMEOUT, MAX_RETRIES, BACKOFF_FACTOR
+# are imported from prometheus_adapter_config above
 
 
 
@@ -176,18 +190,32 @@ class MetricsNormalizer:
             'memory_usage_percent': None,
             'timestamp': datetime.now().isoformat()
         }
-        
-        # Extract request latency (summary metric: sum/count = avg)
-        if 'request_latency_seconds_sum' in parsed_metrics and 'request_latency_seconds_count' in parsed_metrics:
+        # Extract latency_ms Gauge if available
+        if 'latency_ms' in parsed_metrics:
+            try:
+                val = parsed_metrics['latency_ms'][0]['value']
+                normalized['request_latency_ms'] = val
+                normalized['latency_ms'] = val
+            except (IndexError, KeyError) as e:
+                logger.warning(f"Could not extract latency_ms: {e}")
+        # Otherwise derive avg latency from Prometheus summary
+        elif (
+            'request_latency_seconds_sum' in parsed_metrics and
+            'request_latency_seconds_count' in parsed_metrics
+        ):
             try:
                 latency_sum = parsed_metrics['request_latency_seconds_sum'][0]['value']
                 latency_count = parsed_metrics['request_latency_seconds_count'][0]['value']
+
                 if latency_count > 0:
-                    avg_latency_sec = latency_sum / latency_count
-                    normalized['request_latency_ms'] = avg_latency_sec * 1000
+                    val = (latency_sum / latency_count) * 1000
+                    normalized['request_latency_ms'] = val
+                    normalized['latency_ms'] = val
+
             except (IndexError, KeyError, ZeroDivisionError) as e:
-                logger.warning(f"Could not extract latency: {e}")
-        
+                logger.warning(f"Could not derive latency_ms: {e}")
+
+                
         # Extract request count
         if 'request_count_total' in parsed_metrics:
             try:
@@ -319,14 +347,14 @@ class PrometheusMetricsAdapter:
                 normalized = self.normalizer.normalize(parsed_metrics)
                 logger.debug(f"Normalized metrics for {endpoint_name}: {normalized}")
                 
-                # Use service_id@cloud as key for partition routing and agent identification
-                partition_key = f"{config['service_id']}@{config['cloud'].value}"
-                target_partition = config['partition']
+                # Get cloud value - handle both enum and string
+                cloud_value = config["cloud"].value if hasattr(config["cloud"], 'value') else str(config["cloud"]).lower()
+                partition_key = service_key(config["service_id"], cloud_value)
                 event = MetricsEvent(
                     key=partition_key,
                     value=MetricsEventValue(
                         service=config['service_id'],
-                        cloud=config['cloud'],
+                        cloud=cloud_value,  # Pass the lowercase string value
                         timestamp=datetime.now(),
                         metrics=normalized,
                         correlation_id=f"prometheus-{endpoint_name}-{datetime.now().timestamp()}"
@@ -335,15 +363,13 @@ class PrometheusMetricsAdapter:
                 
                 # Send to Kafka with explicit partition assignment
                 try:
-                    record_meta = self.producer.send(KAFKA_TOPIC, event, partition=target_partition)
-                    logger.info(
-                        "Sent metrics for %s to %s with key='%s' partition=%s: %s",
-                        endpoint_name,
-                        KAFKA_TOPIC,
-                        partition_key,
-                        target_partition,
-                        record_meta,
+                    record_meta = self.producer.send(
+                        topic="metrics.events",
+                        event=event,
+                        key=partition_key,
+                        partition=config.get("partition"),
                     )
+                    logger.info(f"Sent metrics for {endpoint_name} to Kafka: {record_meta}")
                 except Exception as e:
                     logger.error(f"Failed to send {endpoint_name} metrics to Kafka: {e}")
                     all_success = False

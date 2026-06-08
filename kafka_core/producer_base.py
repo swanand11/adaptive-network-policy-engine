@@ -69,6 +69,7 @@ import json
 import logging
 from typing import Any
 from datetime import datetime
+from enum import Enum
 from json import JSONEncoder
 
 try:
@@ -98,6 +99,8 @@ class DateTimeEncoder(JSONEncoder):
     def default(self, obj: Any) -> Any:
         if isinstance(obj, datetime):
             return obj.isoformat()
+        if isinstance(obj, Enum):
+            return obj.value
         return super().default(obj)
 
 
@@ -135,7 +138,14 @@ class KafkaProducerTemplate:
             logger.error(f"Failed to initialize Kafka Producer: {e}")
             raise KafkaProducerError(f"Producer initialization failed: {e}")
 
-    def send(self, topic: str, event: BaseModel, partition: int = None) -> str:
+    def send(
+        self,
+        topic: str,
+        event: BaseModel,
+        key: str = None,
+        partition: int = None,
+        producer_agent: str = None,
+    ) -> dict:
         """
         Send event to Kafka topic (blocking).
         
@@ -155,27 +165,51 @@ class KafkaProducerTemplate:
 
         try:
             # Extract key and value from event
-            key = event.key if hasattr(event, "key") else None
+            key = (
+                key
+                if key is not None
+                else event.key if hasattr(event, "key") else None
+            )
             value = event.value if hasattr(event, "value") else event
+            payload = value.dict() if isinstance(value, BaseModel) else value
 
             # Send to Kafka
-            send_kwargs = {
-                "key": key,
-                "value": value.dict() if isinstance(value, BaseModel) else value,
-            }
-            if partition is not None:
-                send_kwargs["partition"] = partition
-            
-            future = self.producer.send(topic, **send_kwargs)
+            future = self.producer.send(
+                topic,
+                key=key,
+                value=payload,
+                partition=partition,
+            )
 
             # Block until send completes
             record_metadata = future.get(timeout=10)
 
+            metadata = {
+                "topic": record_metadata.topic,
+                "partition": record_metadata.partition,
+                "offset": record_metadata.offset,
+            }
+            event_id = payload.get("event_id") if isinstance(payload, dict) else None
+            parent_event_id = payload.get("parent_event_id") if isinstance(payload, dict) else None
+            correlation_id = payload.get("correlation_id") if isinstance(payload, dict) else None
+            producer_name = (
+                producer_agent
+                or (payload.get("producer_agent") if isinstance(payload, dict) else None)
+                or "unknown"
+            )
             logger.info(
-                f"Message sent to topic='{topic}', partition={record_metadata.partition}, offset={record_metadata.offset}"
+                "[KAFKA-PRODUCE] producer=%s topic=%s partition=%s offset=%s "
+                "event_id=%s parent_event_id=%s correlation_id=%s",
+                producer_name,
+                record_metadata.topic,
+                record_metadata.partition,
+                record_metadata.offset,
+                event_id,
+                parent_event_id,
+                correlation_id,
             )
 
-            return f"{record_metadata.topic}@{record_metadata.partition}:{record_metadata.offset}"
+            return metadata
 
         except KafkaError as e:
             error_msg = f"Kafka error sending to topic '{topic}': {e}"
@@ -191,3 +225,8 @@ class KafkaProducerTemplate:
         if self.producer:
             self.producer.close()
             logger.info("Kafka Producer closed")
+
+    def flush(self) -> None:
+        """Flush pending records to Kafka."""
+        if self.producer:
+            self.producer.flush()

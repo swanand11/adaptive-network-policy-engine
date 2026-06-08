@@ -1,6 +1,11 @@
 
 import time
 import json
+from pathlib import Path
+import sys
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from agents.aws.topo import TopographyAgent as AWSTopo
 from agents.aks.topo import TopographyAgent as AKSTopo
@@ -98,7 +103,26 @@ def main():
                 ]
             }
 
+            print("Actions:")
             print(json.dumps(payload, indent=2))
+
+            # Show decision metadata with new fields
+            print("\nDecision Metadata:")
+            metadata = {
+                "agent_type": "topography",
+                "solver": "convex_qp_entropy_regularised",
+                "iteration": agent.iteration_count,
+                "global_state_size": len(agent.global_state),
+                "confidence": (
+                    sum(state["confidence"] for state in agent.global_state.values())
+                    / len(agent.global_state)
+                ) if agent.global_state else 0.0,
+                "temperature": agent.temperature * ((1 - agent.gamma) ** agent.iteration_count),
+                "alpha": agent.alpha,
+                "beta": agent.beta,
+                "gamma": agent.gamma,
+            }
+            print(json.dumps(metadata, indent=2))
 
             # Now publish to Kafka
             agent._publish_actions(actions)

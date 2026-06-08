@@ -1,14 +1,42 @@
+"""e2e_pipeline_runner.py — Continuous end-to-end pipeline runner with REAL Kafka.
+
+Full event timeline per cycle
+------------------------------
+  Mock /metrics endpoint
+      ↓  (HTTP poll)
+  Adapter  →  metrics.events  (3 Kafka partitions)
+      ↓  (KafkaConsumer in background thread)
+  ServiceAgent  →  service.state  (3 Kafka partitions)
+      ↓  (KafkaConsumer in background thread)
+  TopographyAgent  →  topo.decisions  (Kafka)
+
+Every agent runs its real start() loop inside a daemon thread so every hop
+goes through the real broker. A probe KafkaConsumer watches topo.decisions;
+when it sees a decision whose correlation_id matches the current cycle's
+run_id, the wall-clock time from adapter-send to topo-publish is recorded.
+
+Usage
+-----
+    # Terminal 1 — start mock services
+    python run_mocks.py
+
+    # Terminal 2 — run the pipeline (Kafka must be up)
+    python e2e_pipeline_runner.py [--bootstrap-servers localhost:9092] [--interval 5]
+
+Press Ctrl-C to stop; a summary table is printed on exit.
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
 import os
+import queue
 import sys
-import subprocess
+import threading
 import time
 import types
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -18,534 +46,558 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-if not os.getenv("PIPELINE_TEST_DOCKERIZED"):
-    docker_command = [
-        "docker",
-        "run",
-        "--rm",
-        "--network",
-        "container:kafka_1",
-        "-e",
-        "PIPELINE_TEST_DOCKERIZED=1",
-        "-e",
-        "KAFKA_BOOTSTRAP_SERVERS=kafka:9092",
-        "-v",
-        f"{REPO_ROOT}:/work",
-        "-w",
-        "/work",
-        "python:3.11-slim",
-        "sh",
-        "-lc",
-        "python -m pip install --quiet --no-cache-dir -r requirements.txt && python tests/e2e/e2e_pipeline_test.py "
-        + " ".join(json.dumps(arg) for arg in sys.argv[1:]),
-    ]
-    raise SystemExit(subprocess.run(docker_command).returncode)
-
+# ── kafka-python six compatibility shim (Python 3.11+) ──────────────────────
 try:
-    import six  # type: ignore
-    from six import moves as six_moves  # type: ignore
-except Exception:  # pragma: no cover - only used as a compatibility shim
+    import six                               # type: ignore
+    from six import moves as six_moves      # type: ignore
+except Exception:
     six = None
     six_moves = None
 else:
     if six_moves is None:
         six_moves = types.ModuleType("kafka.vendor.six.moves")
-        six_moves.range = range  # type: ignore[attr-defined]
-    sys.modules.setdefault("kafka.vendor.six", six)
+        six_moves.range = range             # type: ignore[attr-defined]
+    sys.modules.setdefault("kafka.vendor.six",       six)
     sys.modules.setdefault("kafka.vendor.six.moves", six_moves)
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer
 from kafka.structs import TopicPartition
 
+from agents.aks.topo import TopographyAgent as AKSTopo
+from agents.aws.topo import TopographyAgent as AWSTopo
+from agents.do.topo  import TopographyAgent as DOTopo
+from agents.service_agent import ServiceAgent
 from kafka_core.config import KafkaConfig
 from kafka_core.enums import CloudProvider
+from kafka_core.pipeline import iter_services
 from kafka_core.producer_base import KafkaProducerTemplate
-from kafka_core.schemas import MetricsEvent, MetricsEventValue, ServiceStateValue
+from kafka_core.prometheus_kafka_adaptar import (
+    MetricsNormalizer,
+    PrometheusParser,
+    PrometheusPoller,
+)
+from kafka_core.schemas import MetricsEvent, MetricsEventValue
 from kafka_core.topic_initializer import TopicInitializer
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger("e2e_runner")
 
-logger = logging.getLogger(__name__)
-
-
-SERVICE_MAPPING = [
-    {"partition": 0, "service": "service-db", "cloud": CloudProvider.AZURE, "latency_ms": 220.0},
-    {"partition": 1, "service": "service-cache-aws", "cloud": CloudProvider.AWS, "latency_ms": 42.0},
-    {"partition": 2, "service": "service-cache", "cloud": CloudProvider.DIGITALOCEAN, "latency_ms": 115.0},
+# ── pipeline topology ────────────────────────────────────────────────────────
+ENDPOINTS: List[Dict[str, Any]] = [
+    {
+        "name": svc.name,
+        "service_id": svc.service_id,
+        "cloud": svc.cloud,
+        "partition": svc.partition,
+        "metrics_url": svc.metrics_url,
+    }
+    for svc in iter_services()
 ]
 
+# ── timing record ────────────────────────────────────────────────────────────
+@dataclass
+class EventTiming:
+    """Latency breakdown for one event travelling through the full pipeline."""
+    cycle:             int
+    service:           str
+    cloud:             str
+
+    # Phase wall-clock durations measured directly
+    adapter_fetch_ms:  float = 0.0   # HTTP GET /metrics
+    adapter_parse_ms:  float = 0.0   # Prometheus text → normalised dict
+    adapter_send_ms:   float = 0.0   # KafkaProducer.send() → metrics.events
+    # The following are measured by watching Kafka: we record the monotonic
+    # instant when the adapter finishes sending, then wait for the downstream
+    # message to appear on Kafka and subtract.
+    metrics_to_state_ms:  float = 0.0   # metrics.events → service.state (Kafka round-trip + ServiceAgent)
+    state_to_topo_ms:     float = 0.0   # service.state  → topo.decisions (Kafka round-trip + TopoAgent)
+
+    @property
+    def adapter_total_ms(self) -> float:
+        return self.adapter_fetch_ms + self.adapter_parse_ms + self.adapter_send_ms
+
+    @property
+    def end_to_end_ms(self) -> float:
+        return self.adapter_total_ms + self.metrics_to_state_ms + self.state_to_topo_ms
+
 
 @dataclass
-class CheckResult:
-    name: str
-    passed: bool
-    details: Dict[str, Any] = field(default_factory=dict)
-    error: Optional[str] = None
-
-
-@dataclass
-class StageResult:
-    name: str
-    passed: bool
-    checks: List[CheckResult] = field(default_factory=list)
-    details: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class TestReport:
+class CycleSummary:
+    cycle:      int
+    run_id:     str
     started_at: str
-    bootstrap_servers: List[str]
-    run_id: str
-    stages: List[StageResult] = field(default_factory=list)
-    failures: List[str] = field(default_factory=list)
-    duration_seconds: float = 0.0
+    timings:    List[EventTiming] = field(default_factory=list)
+    errors:     List[str]         = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
-        return not self.failures and all(stage.passed for stage in self.stages)
+        return not self.errors
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "started_at": self.started_at,
-            "bootstrap_servers": self.bootstrap_servers,
-            "run_id": self.run_id,
-            "duration_seconds": round(self.duration_seconds, 3),
-            "passed": self.passed,
-            "stages": [
-                {
-                    "name": stage.name,
-                    "passed": stage.passed,
-                    "checks": [asdict(check) for check in stage.checks],
-                    "details": stage.details,
-                }
-                for stage in self.stages
-            ],
-            "failures": self.failures,
-        }
+    def avg_e2e_ms(self) -> float:
+        if not self.timings:
+            return 0.0
+        return sum(t.end_to_end_ms for t in self.timings) / len(self.timings)
 
 
-class Reporter:
-    def __init__(self, report_dir: Path, run_id: str):
-        self.report_dir = report_dir
-        self.run_id = run_id
-        self.report_dir.mkdir(parents=True, exist_ok=True)
+# ── helpers: Kafka probe consumer ────────────────────────────────────────────
 
-    def write(self, report: TestReport) -> Dict[str, Path]:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        json_path = self.report_dir / f"pipeline_test_{timestamp}_{self.run_id}.json"
-        html_path = self.report_dir / f"pipeline_test_{timestamp}_{self.run_id}.html"
-
-        payload = report.to_dict()
-        json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        html_path.write_text(self._render_html(payload), encoding="utf-8")
-        return {"json": json_path, "html": html_path}
-
-    def _render_html(self, payload: Dict[str, Any]) -> str:
-        stages_html = []
-        for stage in payload["stages"]:
-            status = "PASSED" if stage["passed"] else "FAILED"
-            checks_html = "".join(
-                f"<li><strong>{self._escape(check['name'])}</strong>: {('PASS' if check['passed'] else 'FAIL')}"
-                f"{(' - ' + self._escape(check['error'])) if check.get('error') else ''}"
-                f"{(' <pre>' + self._escape(json.dumps(check.get('details', {}), indent=2, default=str)) + '</pre>') if check.get('details') else ''}"
-                f"</li>"
-                for check in stage["checks"]
-            )
-            details = self._escape(json.dumps(stage.get("details", {}), indent=2, default=str))
-            stages_html.append(
-                f"<section class='stage {status.lower()}'>"
-                f"<h2>{self._escape(stage['name'])} - {status}</h2>"
-                f"<ul>{checks_html}</ul>"
-                f"<pre>{details}</pre>"
-                f"</section>"
-            )
-
-        failures = "".join(f"<li>{self._escape(failure)}</li>" for failure in payload["failures"])
-        return f"""<!doctype html>
-<html>
-<head>
-  <meta charset='utf-8'>
-  <title>Pipeline Test Report</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; background: #f7f7f9; color: #1d1d1f; }}
-    h1 {{ margin-bottom: 0.2rem; }}
-    .meta {{ color: #555; margin-bottom: 1rem; }}
-    .stage {{ background: #fff; border-radius: 10px; padding: 16px 18px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }}
-    .passed {{ border-left: 6px solid #1f8f4a; }}
-    .failed {{ border-left: 6px solid #c0392b; }}
-    ul {{ margin-top: 0.5rem; }}
-    pre {{ background: #f0f2f5; padding: 12px; border-radius: 8px; overflow: auto; }}
-    .summary {{ background: #fff; padding: 16px 18px; border-radius: 10px; margin-bottom: 16px; }}
-  </style>
-</head>
-<body>
-  <h1>Pipeline Test Report</h1>
-  <div class='meta'>Run ID: {self._escape(payload['run_id'])} | Started: {self._escape(payload['started_at'])} | Duration: {payload['duration_seconds']}s | Result: {('PASSED' if payload['passed'] else 'FAILED')}</div>
-  <div class='summary'>
-    <h2>Failures</h2>
-    <ul>{failures or '<li>None</li>'}</ul>
-  </div>
-  {''.join(stages_html)}
-</body>
-</html>"""
-
-    @staticmethod
-    def _escape(text: str) -> str:
-        return (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-        )
-
-
-def setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+def _end_offsets(topic: str, n_parts: int) -> Dict[int, int]:
+    """Snapshot current end-offsets before we inject events."""
+    cfg = KafkaConfig.get_consumer_config(group_id=f"probe_{uuid4().hex[:8]}")
+    cfg["enable_auto_commit"] = False
+    c = KafkaConsumer(
+        **cfg,
+        value_deserializer=lambda m: json.loads(m.decode()) if m else None,
+        key_deserializer=lambda m: m.decode() if m else None,
     )
+    tps = [TopicPartition(topic, p) for p in range(n_parts)]
+    c.assign(tps)
+    c.poll(timeout_ms=300)
+    ends = {tp.partition: off for tp, off in c.end_offsets(tps).items()}
+    c.close()
+    return ends
 
 
-def topic_partition_count(topic_name: str) -> Optional[int]:
-    with TopicInitializer() as initializer:
-        info = initializer.get_topic_info(topic_name)
-    if not info:
-        return None
-    partitions = info.get("partitions", []) if isinstance(info, dict) else []
-    return len(partitions)
-
-
-def assert_topic_ready(topic_name: str, expected_partitions: Optional[int] = None) -> CheckResult:
-    try:
-        count = topic_partition_count(topic_name)
-        if count is None:
-            return CheckResult(name=f"{topic_name} exists", passed=False, error="topic metadata unavailable")
-        details = {"partitions": count}
-        if expected_partitions is not None:
-            details["expected_partitions"] = expected_partitions
-            if count != expected_partitions:
-                return CheckResult(
-                    name=f"{topic_name} partition count",
-                    passed=False,
-                    details=details,
-                    error=f"expected {expected_partitions}, found {count}",
-                )
-        return CheckResult(name=f"{topic_name} ready", passed=True, details=details)
-    except Exception as exc:
-        return CheckResult(name=f"{topic_name} ready", passed=False, error=str(exc))
-
-
-def assert_broker_reachable() -> CheckResult:
-    try:
-        initializer = TopicInitializer()
-        initializer.close()
-        return CheckResult(name="Broker reachable", passed=True, details={"bootstrap_servers": KafkaConfig.BOOTSTRAP_SERVERS})
-    except Exception as exc:
-        return CheckResult(name="Broker reachable", passed=False, error=str(exc), details={"bootstrap_servers": KafkaConfig.BOOTSTRAP_SERVERS})
-
-
-def make_metrics_event(service: str, cloud: CloudProvider, latency_ms: float, run_id: str, partition: int) -> MetricsEvent:
-    value = MetricsEventValue(
-        service=service,
-        cloud=cloud,
-        timestamp=datetime.now(timezone.utc),
-        metrics={
-            "latency_ms": latency_ms,
-            "request_latency_ms": latency_ms,
-            "request_count": 1,
-            "error_rate_percent": 1.0 if latency_ms > 200 else 0.0,
-            "cpu_percent": 55.0 + partition * 5,
-            "memory_percent": 60.0 + partition * 3,
-        },
-        correlation_id=run_id,
-        parent_event_id=f"stage2-{run_id}",
-    )
-    return MetricsEvent(key=f"{service}@{cloud.value}", value=value)
-
-
-def capture_end_offsets(topic_name: str, partition_count: int) -> Dict[int, int]:
-    config = KafkaConfig.get_consumer_config(group_id=f"pipeline_probe_{uuid4().hex}")
-    config["enable_auto_commit"] = False
-    consumer = KafkaConsumer(
-        **config,
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")) if m else None,
-        key_deserializer=lambda m: m.decode("utf-8") if m else None,
-    )
-    partitions = [TopicPartition(topic_name, index) for index in range(partition_count)]
-    consumer.assign(partitions)
-    consumer.poll(timeout_ms=250)
-    end_offsets = consumer.end_offsets(partitions)
-    offsets = {partition.partition: offset for partition, offset in end_offsets.items()}
-    consumer.close()
-    return offsets
-
-
-def consume_matching_messages(
-    topic_name: str,
-    partition_count: int,
+def _wait_for_message(
+    topic: str,
+    n_parts: int,
     start_offsets: Dict[int, int],
-    timeout_seconds: float,
-    match_fn: Callable[[Dict[str, Any]], bool],
-) -> List[Dict[str, Any]]:
-    config = KafkaConfig.get_consumer_config(group_id=f"pipeline_probe_{uuid4().hex}")
-    config["enable_auto_commit"] = False
-    consumer = KafkaConsumer(
-        **config,
-        value_deserializer=lambda m: json.loads(m.decode("utf-8")) if m else None,
-        key_deserializer=lambda m: m.decode("utf-8") if m else None,
+    match_fn: Callable[[Dict], bool],
+    timeout_s: float = 20.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Block until a message satisfying match_fn appears on topic, or timeout.
+    Returns the first matching message dict, or None.
+    """
+    cfg = KafkaConfig.get_consumer_config(group_id=f"probe_{uuid4().hex[:8]}")
+    cfg["enable_auto_commit"] = False
+    c = KafkaConsumer(
+        **cfg,
+        value_deserializer=lambda m: json.loads(m.decode()) if m else None,
+        key_deserializer=lambda m: m.decode() if m else None,
     )
-    partitions = [TopicPartition(topic_name, index) for index in range(partition_count)]
-    consumer.assign(partitions)
-    consumer.poll(timeout_ms=250)
+    tps = [TopicPartition(topic, p) for p in range(n_parts)]
+    c.assign(tps)
+    c.poll(timeout_ms=300)
+    for tp in tps:
+        c.seek(tp, start_offsets.get(tp.partition, 0))
 
-    for partition in partitions:
-        consumer.seek(partition, start_offsets.get(partition.partition, 0))
-
-    deadline = time.monotonic() + timeout_seconds
-    matches: List[Dict[str, Any]] = []
-
+    deadline = time.monotonic() + timeout_s
     try:
         while time.monotonic() < deadline:
-            records = consumer.poll(timeout_ms=500, max_records=100)
-            if not records:
-                continue
-            for _, topic_records in records.items():
-                for record in topic_records:
-                    payload = record.value or {}
+            records = c.poll(timeout_ms=500, max_records=100)
+            for _, recs in records.items():
+                for rec in recs:
+                    payload = rec.value or {}
                     if match_fn(payload):
-                        matches.append(
-                            {
-                                "topic": record.topic,
-                                "partition": record.partition,
-                                "offset": record.offset,
-                                "key": record.key,
-                                "value": payload,
-                            }
-                        )
-            if matches:
-                break
+                        return {
+                            "topic":     rec.topic,
+                            "partition": rec.partition,
+                            "offset":    rec.offset,
+                            "key":       rec.key,
+                            "value":     payload,
+                        }
     finally:
-        consumer.close()
-
-    return matches
-
-
-def stage_1_readiness() -> StageResult:
-    checks = [
-        assert_broker_reachable(),
-        assert_topic_ready("metrics.events", expected_partitions=3),
-        assert_topic_ready("service.state"),
-    ]
-
-    passed = all(check.passed for check in checks)
-    details = {
-        "metrics_events_partitions": topic_partition_count("metrics.events"),
-        "service_state_partitions": topic_partition_count("service.state"),
-    }
-    return StageResult(name="Stage 1 - Kafka Readiness", passed=passed, checks=checks, details=details)
+        c.close()
+    return None
 
 
-def stage_2_send_events(producer: KafkaProducerTemplate, run_id: str) -> StageResult:
-    checks: List[CheckResult] = []
-    sent: List[Dict[str, Any]] = []
+# ── agent background threads ─────────────────────────────────────────────────
+#
+# Each agent runs its real start() loop (which internally calls
+# KafkaConsumer.poll() in a loop).  We stop it by calling close() which
+# closes the underlying KafkaConsumer, causing the poll loop to raise and
+# exit gracefully.
 
-    for item in SERVICE_MAPPING:
-        event = make_metrics_event(
-            service=item["service"],
-            cloud=item["cloud"],
-            latency_ms=item["latency_ms"],
-            run_id=run_id,
-            partition=item["partition"],
-        )
+class _AgentThread(threading.Thread):
+    """Thin wrapper: runs agent.start() and exposes a stop() method."""
+
+    def __init__(self, agent, name: str):
+        super().__init__(name=name, daemon=True)
+        self._agent = agent
+        self._exc: Optional[Exception] = None
+
+    def run(self):
         try:
-            record = producer.send("metrics.events", event, partition=item["partition"])
-            checks.append(
-                CheckResult(
-                    name=f"Send partition {item['partition']}",
-                    passed=True,
-                    details={"record": record, "service": item["service"], "cloud": item["cloud"].value},
-                )
-            )
-            sent.append(
-                {
-                    "partition": item["partition"],
-                    "service": item["service"],
-                    "cloud": item["cloud"].value,
-                    "latency_ms": item["latency_ms"],
-                    "record": record,
-                }
-            )
+            self._agent.start()
         except Exception as exc:
-            checks.append(
-                CheckResult(
-                    name=f"Send partition {item['partition']}",
-                    passed=False,
-                    details={"service": item["service"], "cloud": item["cloud"].value},
-                    error=str(exc),
-                )
-            )
+            self._exc = exc
+            logger.error("Agent thread %s crashed: %s", self.name, exc)
 
-    passed = all(check.passed for check in checks)
-    return StageResult(name="Stage 2 - Send Metrics Events", passed=passed, checks=checks, details={"sent": sent})
+    def stop(self):
+        try:
+            self._agent.close()
+        except Exception:
+            pass
 
 
-def stage_3_verify_partition_routing(run_id: str, start_offsets: Dict[int, int]) -> StageResult:
-    partition_count = 3
-    checks: List[CheckResult] = []
-    verified: List[Dict[str, Any]] = []
-
-    expected_by_partition = {item["partition"]: item for item in SERVICE_MAPPING}
-    for partition, expected in expected_by_partition.items():
-        matches = consume_matching_messages(
-            topic_name="metrics.events",
-            partition_count=partition_count,
-            start_offsets=start_offsets,
-            timeout_seconds=8.0,
-            match_fn=lambda payload, expected=expected, run_id=run_id: payload.get("correlation_id") == run_id and payload.get("service") == expected["service"],
-        )
-        passed = bool(matches)
-        checks.append(
-            CheckResult(
-                name=f"Partition {partition}",
-                passed=passed,
-                details={"expected_service": expected["service"], "matches": len(matches)},
-                error=None if passed else "expected event not found",
-            )
-        )
-        if matches:
-            verified.append({"partition": partition, "service": expected["service"], "offset": matches[0]["offset"]})
-
-    return StageResult(name="Stage 3 - Partition Routing", passed=all(check.passed for check in checks), checks=checks, details={"verified": verified})
-
-
-def stage_4_verify_service_state(run_id: str, start_offsets: Dict[int, int]) -> StageResult:
-    partition_count = 2
-    checks: List[CheckResult] = []
-    service_hits: Dict[str, List[Dict[str, Any]]] = {item["service"]: [] for item in SERVICE_MAPPING}
-
-    matches = consume_matching_messages(
-        topic_name="service.state",
-        partition_count=partition_count,
-        start_offsets=start_offsets,
-        timeout_seconds=12.0,
-        match_fn=lambda payload: payload.get("correlation_id") == run_id,
+def _make_service_agent(ep: Dict, producer: KafkaProducerTemplate, run_id: str) -> ServiceAgent:
+    return ServiceAgent(
+        service_id=ep["service_id"],
+        cloud=ep["cloud"].value,
+        cloud_producer=producer,
+        group_id=f"e2e_sa_{ep['name']}_{run_id[:8]}",
+        partition=ep["partition"],
     )
 
-    for match in matches:
-        try:
-            parsed = ServiceStateValue(**match["value"])
-            service_hits.setdefault(parsed.service, []).append(
-                {
-                    "partition": match["partition"],
-                    "offset": match["offset"],
-                    "cloud": parsed.cloud.value if hasattr(parsed.cloud, "value") else str(parsed.cloud),
-                    "status": parsed.belief.status,
-                    "confidence": parsed.belief.confidence,
-                    "optimal_load": parsed.intent.optimal_load,
-                }
-            )
-        except Exception as exc:
-            checks.append(CheckResult(name="Parse service.state payload", passed=False, error=str(exc)))
 
-    for item in SERVICE_MAPPING:
-        hits = service_hits.get(item["service"], [])
-        checks.append(
-            CheckResult(
-                name=f"service.state for {item['service']}",
-                passed=bool(hits),
-                details={"messages": hits},
-                error=None if hits else "no published service.state message found",
-            )
+def _make_topo_agent(name: str, producer: KafkaProducerTemplate, run_id: str):
+    """
+    TopographyAgent.__init__ calls super().__init__(topics, group_id) which
+    creates a KafkaConsumer. We pass a fresh group_id so each run starts from
+    the latest offset on service.state.
+    """
+    group = f"e2e_topo_{name}_{run_id[:8]}"
+    cls_map = {"aws": AWSTopo, "aks": AKSTopo, "do": DOTopo}
+    # TopographyAgent(service_id, consumer=None, producer=None)
+    # When consumer=None it calls super().__init__() creating a real consumer.
+    return cls_map[name](
+        service_id=name,
+        consumer=None,
+        producer=producer,
+        group_id=group,
+        partitions={"service.state": [0, 1, 2]},
+    )
+
+
+# ── printing ─────────────────────────────────────────────────────────────────
+
+_HDR = (
+    f"  {'Service':<22} {'fetch':>8} {'parse':>7} {'->metrics':>10} "
+    f"{'svc_agent':>11} {'->topo':>8}  |  {'E2E':>9}"
+)
+_SEP = f"  {'':->22} {'':->8} {'':->7} {'':->10} {'':->11} {'':->8}  |  {'':->9}"
+
+
+def _print_cycle(s: CycleSummary) -> None:
+    status = "OK" if s.passed else "FAIL"
+    print(f"\n{'─'*82}")
+    print(f"  Cycle {s.cycle:3d}  [{status}]  run_id={s.run_id}  {s.started_at}")
+    print(f"{'─'*82}")
+    print(_HDR)
+    print(_SEP)
+    for t in s.timings:
+        print(
+            f"  {t.service:<22} "
+            f"{t.adapter_fetch_ms:>7.1f}ms "
+            f"{t.adapter_parse_ms:>6.1f}ms "
+            f"{t.adapter_send_ms:>9.1f}ms "
+            f"{t.metrics_to_state_ms:>10.1f}ms "
+            f"{t.state_to_topo_ms:>7.1f}ms  |"
+            f"{t.end_to_end_ms:>9.1f}ms"
         )
+    if s.timings:
+        print(_SEP)
+        print(f"  {'avg E2E':>60}  |{s.avg_e2e_ms():>9.1f}ms")
+    for err in s.errors:
+        print(f"  !! {err}")
 
-    details = {service: len(messages) for service, messages in service_hits.items()}
-    return StageResult(name="Stage 4 - Service State Publishing", passed=all(check.passed for check in checks), checks=checks, details=details)
+
+def _print_final(all_s: List[CycleSummary]) -> None:
+    all_t = [t for s in all_s for t in s.timings]
+    if not all_t:
+        return
+
+    def avg(fn):
+        v = [fn(t) for t in all_t]
+        return sum(v) / len(v)
+
+    print(f"\n{'='*82}")
+    print("  FINAL SUMMARY")
+    print(f"{'='*82}")
+    print(f"  Cycles completed : {len(all_s)}")
+    print(f"  Total events     : {len(all_t)}")
+    print(f"  Total errors     : {sum(len(s.errors) for s in all_s)}")
+    print()
+    print(f"  Phase averages (all services & cycles):")
+    print(f"    Adapter HTTP fetch      : {avg(lambda t: t.adapter_fetch_ms):>8.1f} ms")
+    print(f"    Adapter parse+normalise : {avg(lambda t: t.adapter_parse_ms):>8.1f} ms")
+    print(f"    Adapter Kafka send      : {avg(lambda t: t.adapter_send_ms):>8.1f} ms")
+    print(f"    ServiceAgent (Kafka RT) : {avg(lambda t: t.metrics_to_state_ms):>8.1f} ms")
+    print(f"    TopoAgent   (Kafka RT)  : {avg(lambda t: t.state_to_topo_ms):>8.1f} ms")
+    print(f"    {'─'*35}")
+    print(f"    End-to-end avg          : {avg(lambda t: t.end_to_end_ms):>8.1f} ms")
+    print(f"    End-to-end min          : {min(t.end_to_end_ms for t in all_t):>8.1f} ms")
+    print(f"    End-to-end max          : {max(t.end_to_end_ms for t in all_t):>8.1f} ms")
+    print()
+    print(f"  Per-service averages:")
+    by_svc: Dict[str, List[EventTiming]] = {}
+    for t in all_t:
+        by_svc.setdefault(t.service, []).append(t)
+    for svc, ts in sorted(by_svc.items()):
+        print(f"    {svc:<26} {sum(t.end_to_end_ms for t in ts)/len(ts):>8.1f} ms avg E2E  (n={len(ts)})")
+    print(f"{'='*82}\n")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Stage-by-stage end-to-end Kafka pipeline test")
-    parser.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
-    parser.add_argument("--report-dir", default="tests/reports")
+# ── main pipeline cycle ───────────────────────────────────────────────────────
+
+def _run_cycle(
+    cycle:          int,
+    run_id:         str,
+    producer:       KafkaProducerTemplate,
+    poller:         PrometheusPoller,
+    svc_threads:    List[_AgentThread],
+    topo_threads:   List[_AgentThread],
+) -> CycleSummary:
+    summary = CycleSummary(
+        cycle=cycle,
+        run_id=run_id,
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # Snapshot current tail-offsets so probe consumers only see new messages
+    metrics_offsets = _end_offsets("metrics.events", 3)
+    state_offsets   = _end_offsets("service.state",  3)
+    topo_offsets    = _end_offsets("topo.decisions",  3)
+
+    # ── PHASE 1: Adapter scrapes /metrics and publishes to metrics.events ────
+    send_instants: Dict[str, float] = {}   # service_id → monotonic time after send
+
+    for ep in ENDPOINTS:
+        timing = EventTiming(cycle=cycle, service=ep["service_id"], cloud=ep["cloud"].value)
+
+        try:
+            # 1a. HTTP fetch
+            t0 = time.monotonic()
+            dump = poller.poll(ep["metrics_url"])
+            timing.adapter_fetch_ms = (time.monotonic() - t0) * 1000
+            if not dump:
+                summary.errors.append(f"[{ep['name']}] Prometheus poll empty")
+                continue
+
+            # 1b. Parse + normalise
+            t1 = time.monotonic()
+            normalised = MetricsNormalizer.normalize(PrometheusParser.parse_dump(dump))
+            timing.adapter_parse_ms = (time.monotonic() - t1) * 1000
+
+            # 1c. Publish to Kafka metrics.events
+            event = MetricsEvent(
+                key=f"{ep['service_id']}@{ep['cloud'].value}",
+                value=MetricsEventValue(
+                    service=ep["service_id"],
+                    cloud=ep["cloud"],
+                    timestamp=datetime.now(timezone.utc),
+                    metrics=normalised,
+                    correlation_id=run_id,
+                    parent_event_id=f"cycle-{cycle}",
+                ),
+            )
+            t2 = time.monotonic()
+            producer.send("metrics.events", event, partition=ep["partition"])
+            timing.adapter_send_ms = (time.monotonic() - t2) * 1000
+
+            # Record the instant the adapter finished sending so we can
+            # measure how long the downstream agents take.
+            send_instants[ep["service_id"]] = time.monotonic()
+            summary.timings.append(timing)
+
+            logger.info(
+                "Cycle %d | adapter sent %s to metrics.events[%d] in %.1f ms total",
+                cycle, ep["service_id"], ep["partition"], timing.adapter_total_ms,
+            )
+
+        except Exception as exc:
+            summary.errors.append(f"[{ep['name']}] Adapter: {exc}")
+            logger.exception("Adapter error for %s", ep["name"])
+
+    # ── PHASE 2: Wait for ServiceAgents to publish to service.state ──────────
+    # The real ServiceAgent threads are polling metrics.events; we just wait
+    # for their output to appear on service.state.
+
+    for timing in summary.timings:
+        sid = timing.service
+        t_sent = send_instants.get(sid)
+        if t_sent is None:
+            continue
+
+        msg = _wait_for_message(
+            "service.state", 3, state_offsets,
+            match_fn=lambda p, s=sid: (
+                p.get("correlation_id") == run_id and p.get("service") == s
+            ),
+            timeout_s=20.0,
+        )
+        if msg:
+            timing.metrics_to_state_ms = (time.monotonic() - t_sent) * 1000
+            logger.info(
+                "Cycle %d | service.state received for %s  (%.1f ms since adapter send)",
+                cycle, sid, timing.metrics_to_state_ms,
+            )
+        else:
+            summary.errors.append(
+                f"[{sid}] service.state not seen within timeout (are ServiceAgent threads running?)"
+            )
+            logger.error("Cycle %d | timeout waiting for service.state for %s", cycle, sid)
+
+    # ── PHASE 3: Wait for TopoAgents to publish to topo.decisions ────────────
+    # TopoAgents consume service.state and publish topo.decisions.
+
+    for timing in summary.timings:
+        sid = timing.service
+        # We use the end of phase 2 (state received) as the start for phase 3
+        t_state = time.monotonic() - timing.state_to_topo_ms  # approximate
+        t_state_abs = time.monotonic()  # use current monotonic as start
+
+        msg = _wait_for_message(
+            "topo.decisions", 3, topo_offsets,
+            match_fn=lambda p, s=sid: (
+                p.get("service") == s and
+                p.get("metadata", {}).get("agent_type") == "topography"
+            ),
+            timeout_s=25.0,
+        )
+        if msg:
+            timing.state_to_topo_ms = (time.monotonic() - t_state_abs) * 1000
+            actions = msg["value"].get("actions", [])
+            logger.info(
+                "Cycle %d | topo.decisions received for %s  "
+                "(%.1f ms for topo hop, %d actions, E2E=%.1f ms)",
+                cycle, sid, timing.state_to_topo_ms,
+                len(actions), timing.end_to_end_ms,
+            )
+        else:
+            summary.errors.append(
+                f"[{sid}] topo.decisions not seen within timeout "
+                f"(load may be balanced — topo agent skips publishing)"
+            )
+            logger.warning(
+                "Cycle %d | topo.decisions not seen for %s "
+                "(balanced load = no action = normal)", cycle, sid,
+            )
+
+    return summary
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Continuous E2E pipeline: adapter -> metrics.events -> "
+            "ServiceAgent -> service.state -> TopoAgent -> topo.decisions"
+        )
+    )
+    parser.add_argument(
+        "--bootstrap-servers",
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"),
+    )
+    parser.add_argument(
+        "--interval", type=float, default=5.0,
+        help="Seconds between pipeline cycles (default: 5)",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
-    setup_logging(args.verbose)
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    bootstrap_servers = [server.strip() for server in args.bootstrap_servers.split(",") if server.strip()]
-    KafkaConfig.BOOTSTRAP_SERVERS = bootstrap_servers
-    os.environ["KAFKA_BOOTSTRAP_SERVERS"] = ",".join(bootstrap_servers)
+    # Apply bootstrap servers globally
+    servers = [s.strip() for s in args.bootstrap_servers.split(",") if s.strip()]
+    KafkaConfig.BOOTSTRAP_SERVERS = servers
+    os.environ["KAFKA_BOOTSTRAP_SERVERS"] = ",".join(servers)
+
+    logger.info("Bootstrap servers : %s", servers)
+    logger.info("Cycle interval    : %.1f s", args.interval)
+
+    # ── one-time Kafka topic setup ────────────────────────────────────────────
+    logger.info("Ensuring Kafka topics exist …")
+    with TopicInitializer() as init:
+        init.create_all_topics()
+    logger.info("Topics OK")
+
+    # ── shared producer (used by all agents and the adapter) ─────────────────
+    producer = KafkaProducerTemplate()
 
     run_id = uuid4().hex[:12]
-    report = TestReport(
-        started_at=datetime.now(timezone.utc).isoformat(),
-        bootstrap_servers=bootstrap_servers,
-        run_id=run_id,
-    )
+    poller = PrometheusPoller()
 
-    start_time = time.monotonic()
-    reporter = Reporter(report_dir=Path(args.report_dir), run_id=run_id)
-    producer = None
+    # ── start ServiceAgent background threads (one per endpoint) ─────────────
+    # Each gets a unique consumer group so it sees ALL partitions of
+    # metrics.events from the beginning of this run.
+    logger.info("Starting ServiceAgent threads …")
+    svc_threads: List[_AgentThread] = []
+    for ep in ENDPOINTS:
+        agent = ServiceAgent(
+            service_id=ep["service_id"],
+            cloud=ep["cloud"].value,
+            cloud_producer=producer,
+            group_id=f"e2e_sa_{ep['name']}_{run_id[:8]}",
+            partition=ep["partition"],
+        )
+        t = _AgentThread(agent, name=f"SA-{ep['name']}")
+        t.start()
+        svc_threads.append(t)
+        logger.info("  ServiceAgent for %-20s started (group=e2e_sa_%s_%s)",
+                    ep["service_id"], ep["name"], run_id[:8])
+
+    # ── start TopographyAgent background threads (one per cloud) ─────────────
+    logger.info("Starting TopographyAgent threads …")
+    topo_threads: List[_AgentThread] = []
+    for name, cls in [("aws", AWSTopo), ("aks", AKSTopo), ("do", DOTopo)]:
+        agent = cls(
+            service_id=name,
+            consumer=None,      # None → real KafkaConsumer on service.state
+            producer=producer,
+            group_id=f"e2e_topo_{name}_{run_id[:8]}",
+            partitions={"service.state": [0, 1, 2]},
+        )
+        t = _AgentThread(agent, name=f"Topo-{name}")
+        t.start()
+        topo_threads.append(t)
+        logger.info("  TopoAgent for %-8s started", name)
+
+    # Brief warm-up: give Kafka consumers time to receive partition assignments
+    logger.info("Waiting 3 s for agent consumers to initialise …")
+    time.sleep(3)
+
+    all_summaries: List[CycleSummary] = []
+    cycle = 0
+
+    print(f"\n{'='*82}")
+    print(f"  E2E Pipeline Runner   run_id={run_id}")
+    print(f"  Agents: {len(svc_threads)} ServiceAgent(s), {len(topo_threads)} TopographyAgent(s)")
+    print(f"  Cycle interval: {args.interval}s  |  Ctrl-C to stop")
+    print(f"{'='*82}\n")
 
     try:
-        logger.info("Starting pipeline test run_id=%s", run_id)
+        while True:
+            cycle += 1
+            cycle_start = time.monotonic()
 
-        stage1 = stage_1_readiness()
-        report.stages.append(stage1)
-        if not stage1.passed:
-            report.failures.append("Stage 1 failed")
-            return finalize(report, reporter, start_time)
+            summary = _run_cycle(
+                cycle=cycle,
+                run_id=run_id,
+                producer=producer,
+                poller=poller,
+                svc_threads=svc_threads,
+                topo_threads=topo_threads,
+            )
+            all_summaries.append(summary)
+            _print_cycle(summary)
 
-        metrics_offsets = capture_end_offsets("metrics.events", 3)
-        service_state_offsets = capture_end_offsets("service.state", 2)
+            elapsed = time.monotonic() - cycle_start
+            sleep_for = max(0.0, args.interval - elapsed)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
-        producer = KafkaProducerTemplate()
-        stage2 = stage_2_send_events(producer, run_id)
-        report.stages.append(stage2)
-        if not stage2.passed:
-            report.failures.append("Stage 2 failed")
+    except KeyboardInterrupt:
+        print("\nCtrl-C received — stopping pipeline runner.")
 
-        stage3 = stage_3_verify_partition_routing(run_id, metrics_offsets)
-        report.stages.append(stage3)
-        if not stage3.passed:
-            report.failures.append("Stage 3 failed")
-
-        stage4 = stage_4_verify_service_state(run_id, service_state_offsets)
-        report.stages.append(stage4)
-        if not stage4.passed:
-            report.failures.append("Stage 4 failed")
-
-        return finalize(report, reporter, start_time)
-    except Exception as exc:
-        logger.exception("Unexpected failure in pipeline test: %s", exc)
-        report.failures.append(str(exc))
-        return finalize(report, reporter, start_time)
     finally:
-        if producer is not None:
+        logger.info("Stopping agent threads …")
+        for t in svc_threads + topo_threads:
+            t.stop()
+        for t in svc_threads + topo_threads:
+            t.join(timeout=5)
+        try:
             producer.close()
-
-
-def finalize(report: TestReport, reporter: Reporter, start_time: float) -> int:
-    report.duration_seconds = time.monotonic() - start_time
-    paths = reporter.write(report)
-
-    print("\n" + "=" * 72)
-    print("PIPELINE TEST SUMMARY")
-    print("=" * 72)
-    for stage in report.stages:
-        print(f"{'PASS' if stage.passed else 'FAIL'} - {stage.name}")
-        for check in stage.checks:
-            status = "PASS" if check.passed else "FAIL"
-            tail = f" | {check.error}" if check.error else ""
-            print(f"  {status} - {check.name}{tail}")
-    print("-" * 72)
-    print(f"Run ID: {report.run_id}")
-    print(f"Duration: {report.duration_seconds:.2f}s")
-    print(f"Overall: {'PASS' if report.passed else 'FAIL'}")
-    print(f"JSON report: {paths['json']}")
-    print(f"HTML report: {paths['html']}")
-    print("=" * 72)
-
-    return 0 if report.passed else 1
+        except Exception:
+            pass
+        _print_final(all_summaries)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

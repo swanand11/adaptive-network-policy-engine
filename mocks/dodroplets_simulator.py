@@ -1,43 +1,68 @@
-"""DigitalOcean Simulator - Droplet metrics via Prometheus."""
+"""DigitalOcean Cloud Simulator - Droplet service metrics via Prometheus.
+
+UPDATED: Traffic-driven metrics reflecting actual load from load balancer.
+DigitalOcean characteristics: Higher latency, lower performance, struggles under heavy load.
+"""
 
 import random
 from mocks.base_simulator import BaseSimulator
 
-
 class DigitalOceanSimulator(BaseSimulator):
-    """Simulates DigitalOcean Droplet metrics."""
+    """Simulates DigitalOcean service metrics. Lower performance under load."""
 
-    def __init__(self, service_name: str = "service-cache", service_port: int = 8003):
+    def __init__(self, service_name: str = "service-api", service_port: int = 8003):
         super().__init__(service_name, "digitalocean", service_port, service_port)
-        self.latency_baseline = 55  # DO moderate-low latency
-        self.cpu_baseline = 40
-        self.error_rate_baseline = 0.8
 
-    def generate_metrics(self) -> dict:
-        """Generate DigitalOcean Droplet-specific metrics."""
-        latency = max(10, self.latency_baseline + random.gauss(0, 12))
-        cpu = max(5, min(100, self.cpu_baseline + random.gauss(0, 12)))
-        error_rate = max(0, min(10, self.error_rate_baseline + random.gauss(0, 0.4)))
-        memory = max(25, min(100, random.randint(25, 75)))
-
-        # Occasional traffic bursts
-        if random.random() < 0.15:
-            cpu *= 1.3
+    def generate_metrics(self, active_requests: int) -> dict:
+        """Generate DigitalOcean-specific metrics based on active load.
+        
+        DigitalOcean characteristics:
+        - Higher base latency (60ms)
+        - Struggles with scaling
+        - Higher error rate, especially under load
+        """
+        # Latency scales significantly with load
+        latency = 60.0 + (active_requests * 5.0) + random.gauss(0, 5)
+        
+        # CPU increases rapidly
+        cpu = min(100.0, 30.0 + (active_requests * 2.5) + random.gauss(0, 3))
+        
+        # Error rate increases early
+        if cpu < 60:
+            error_rate = 1.0
+        else:
+            error_rate = 1.0 + ((cpu - 60) * 1.5)
+            
+        memory = min(100.0, 50.0 + (active_requests * 0.5))
 
         return {
-            "latency_ms": latency,
-            "cpu": cpu,
+            "latency_ms": max(1, latency),
+            "cpu": max(1, cpu),
             "memory_percent": memory,
-            "error_rate": error_rate,
-            "requests_per_sec": random.randint(120, 550),
-            "bandwidth_mbps": random.randint(50, 300),
-            "region": random.choice(["nyc3", "sfo3", "lon1", "sgp1"]),
+            "error_rate": min(100, error_rate)
         }
-
+    
+    def compute_resource_usage(self, active_connections: int, rps: float) -> tuple:
+        """Compute CPU and memory based on traffic load.
+        
+        Args:
+            active_connections: Current active connections
+            rps: Requests per second
+            
+        Returns:
+            (cpu_percent, memory_percent)
+        """
+        # DigitalOcean scales poorly
+        base_cpu = 25.0
+        cpu = min(100.0, base_cpu + (active_connections * 4.0) + (rps * 1.2))
+        
+        base_memory = 45.0
+        memory = min(100.0, base_memory + (active_connections * 2.0) + (rps * 0.8))
+        
+        return (cpu, memory)
 
 if __name__ == "__main__":
     import os
-
     port = int(os.getenv("SERVICE_PORT", "8003"))
     simulator = DigitalOceanSimulator(service_port=port)
     simulator.run()

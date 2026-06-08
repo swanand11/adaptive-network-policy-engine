@@ -105,6 +105,15 @@ class GovernanceAgent(KafkaConsumerTemplate):
             timestamp = message.get("timestamp")
             metadata = message.get("metadata", {})
             
+            # If timestamp is a string, parse it to a datetime object
+            if isinstance(timestamp, str):
+                try:
+                    if timestamp.endswith("Z"):
+                        timestamp = timestamp[:-1] + "+00:00"
+                    timestamp = datetime.fromisoformat(timestamp)
+                except ValueError:
+                    logger.warning(f"Could not parse timestamp string: {timestamp}")
+            
             # Generate decision_id from service + timestamp (unique identifier)
             decision_id = f"topo-{service}-{int(timestamp.timestamp() * 1000) if hasattr(timestamp, 'timestamp') else 0}"
             
@@ -217,6 +226,13 @@ class GovernanceAgent(KafkaConsumerTemplate):
         )
 
         self.producer.send("policy.decisions", governance_event)
+
+        # Persist selected weights so next batch can use them as KL baseline.
+        self.store.save_applied_weights(
+            W_best,
+            governance_decision_id,
+            self.root_correlation_id,
+        )
 
         logger.info(
             f"Published governance decision: governance_id={governance_decision_id}, "

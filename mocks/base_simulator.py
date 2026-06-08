@@ -1,46 +1,77 @@
-"""Base Cloud Simulator - Flask server with Prometheus metrics."""
+"""Base Cloud Simulator - Flask server with Prometheus metrics.
+
+UPDATED: Traffic-driven metrics instead of random generation.
+Metrics now reflect actual request load from the load balancer.
+"""
 
 import random
 import time
 import logging
+import threading
 from typing import Dict, Any
 from datetime import datetime
 from abc import ABC, abstractmethod
-from flask import Flask
-from prometheus_client import Counter, Gauge, Summary, generate_latest, CollectorRegistry
+from flask import Flask, Response, request
+from prometheus_client import Counter, Gauge, Summary, Histogram, generate_latest, CollectorRegistry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class MetricsState:
+    """Track real-time metrics state based on actual traffic."""
+    
+    def __init__(self):
+        self.total_requests = 0
+        self.total_errors = 0
+        self.active_connections = 0
+        self.queue_depth = 0
+        self.latency_samples = []
+        self.bandwidth_bytes = 0
+        self._lock = threading.Lock()
+    
+    def record_request(self, latency_ms: float, is_error: bool = False, bytes_sent: int = 0):
+        """Record a completed request."""
+        with self._lock:
+            self.total_requests += 1
+            if is_error:
+                self.total_errors += 1
+            self.latency_samples.append(latency_ms)
+            if len(self.latency_samples) > 100:
+                self.latency_samples.pop(0)
+            self.bandwidth_bytes += bytes_sent
+    
+    def get_error_rate(self) -> float:
+        """Calculate current error rate percentage."""
+        with self._lock:
+            if self.total_requests == 0:
+                return 0.0
+            return (self.total_errors / self.total_requests) * 100
+    
+    def get_avg_latency(self) -> float:
+        """Calculate average latency from recent samples."""
+        with self._lock:
+            if not self.latency_samples:
+                return 0.0
+            return sum(self.latency_samples) / len(self.latency_samples)
+
+
 class BaseSimulator(ABC):
-    """Base class for cloud simulators with Prometheus metrics."""
+    """Base class for cloud simulators with traffic-driven Prometheus metrics."""
 
     def __init__(self, service_name: str, cloud_name: str, service_port: int, metrics_port: int):
-        """
-        Initialize simulator.
-        
-        Args:
-            service_name: Service identifier (e.g., 'service-api')
-            cloud_name: Cloud provider (aws, aks, digitalocean)
-            service_port: Flask app port
-            metrics_port: Prometheus metrics port (usually same as service_port)
-        """
         self.service_name = service_name
         self.cloud_name = cloud_name
         self.service_port = service_port
         self.metrics_port = metrics_port
         
-        # Create Flask app
         self.app = Flask(f"{cloud_name}-simulator")
-        
-        # Create custom registry for this service
         self.registry = CollectorRegistry()
         
         # Prometheus metrics
-        self.request_latency = Summary(
-            'request_latency_seconds',
-            'Request latency in seconds',
+        self.request_latency = Gauge(
+            'latency_ms',
+            'Request latency in milliseconds',
             ['cloud', 'service_id'],
             registry=self.registry
         )
@@ -68,78 +99,150 @@ class BaseSimulator(ABC):
             ['cloud', 'service_id'],
             registry=self.registry
         )
+        self.active_connections_gauge = Gauge(
+            'active_connections',
+            'Active connections',
+            ['cloud', 'service_id'],
+            registry=self.registry
+        )
+        self.requests_per_second = Gauge(
+            'requests_per_second',
+            'Requests per second',
+            ['cloud', 'service_id'],
+            registry=self.registry
+        )
+
+        # Traffic-driven state
+        self.metrics_state = MetricsState()
+        self._lock = threading.Lock()
+        
+        # Start background metrics updater
+        self._start_metrics_updater()
         
         self._setup_routes()
 
+    def _start_metrics_updater(self):
+        """Background thread to update computed metrics."""
+        def update_loop():
+            last_request_count = 0
+            while True:
+                try:
+                    cloud_labels = {"cloud": self.cloud_name, "service_id": self.service_name}
+                    
+                    # Calculate requests per second
+                    current_requests = self.metrics_state.total_requests
+                    rps = current_requests - last_request_count
+                    last_request_count = current_requests
+                    self.requests_per_second.labels(**cloud_labels).set(rps)
+                    
+                    # Update error rate
+                    error_rate = self.metrics_state.get_error_rate()
+                    self.error_rate.labels(**cloud_labels).set(error_rate)
+                    
+                    # Update active connections
+                    self.active_connections_gauge.labels(**cloud_labels).set(
+                        self.metrics_state.active_connections
+                    )
+                    
+                    # Compute CPU and memory based on load
+                    cpu, memory = self.compute_resource_usage(
+                        self.metrics_state.active_connections,
+                        rps
+                    )
+                    self.cpu_usage.labels(**cloud_labels).set(cpu)
+                    self.memory_usage.labels(**cloud_labels).set(memory)
+                    
+                    time.sleep(1)  # Update every second
+                except Exception as e:
+                    logger.error(f"Error in metrics updater: {e}")
+                    time.sleep(1)
+        
+        thread = threading.Thread(target=update_loop, daemon=True)
+        thread.start()
+
     def _setup_routes(self):
-        """Setup Flask routes."""
         @self.app.route("/")
-        def home():
-            """Health check endpoint."""
-            return {
-                "status": "ok",
-                "service": self.service_name,
-                "cloud": self.cloud_name
-            }
+        @self.app.route("/request")
+        def handle_request():
+            """Handle incoming traffic and generate realistic metrics."""
+            start_time = time.time()
+            
+            with self._lock:
+                self.metrics_state.active_connections += 1
+            
+            try:
+                cloud_labels = {"cloud": self.cloud_name, "service_id": self.service_name}
+                
+                # Generate metrics based on current load
+                metrics_data = self.generate_metrics(self.metrics_state.active_connections)
+                
+                latency_s = metrics_data.get("latency_ms", 100) / 1000.0
+                error_rate = metrics_data.get("error_rate", 0.5)
+
+                # Simulate processing time
+                time.sleep(latency_s)
+
+                # Determine if this request errors
+                is_error = random.random() < (error_rate / 100.0)
+                
+                # Calculate actual latency
+                actual_latency_ms = (time.time() - start_time) * 1000
+                
+                # Record metrics
+                self.request_count.labels(**cloud_labels).inc()
+                self.request_latency.labels(**cloud_labels).set(actual_latency_ms)
+                
+                # Update state
+                response_size = 200 if not is_error else 100
+                self.metrics_state.record_request(
+                    actual_latency_ms,
+                    is_error,
+                    response_size
+                )
+                
+                if is_error:
+                    return Response(
+                        '{"error": "Internal Server Error", "status": "failed"}',
+                        status=500,
+                        mimetype='application/json'
+                    )
+                
+                return {
+                    "status": "ok",
+                    "service": self.service_name,
+                    "cloud": self.cloud_name,
+                    "active_connections": self.metrics_state.active_connections,
+                    "latency_ms": actual_latency_ms,
+                    "total_requests": self.metrics_state.total_requests
+                }
+            finally:
+                with self._lock:
+                    self.metrics_state.active_connections -= 1
 
         @self.app.route("/metrics")
         def metrics():
-            """Prometheus metrics endpoint."""
             return generate_latest(self.registry), 200, {
-    "Content-Type": "text/plain; version=0.0.4"
-}
-
-        @self.app.route("/simulate", methods=["POST"])
-        def simulate():
-            """Simulate a request (for testing)."""
-            self.simulate_request()
-            return {"status": "simulated"}
-
-    def simulate_request(self):
-        """Simulate a single request with metrics."""
-        # Generate metrics
-        cloud_labels = {"cloud": self.cloud_name, "service_id": self.service_name}
-        metrics_data = self.generate_metrics()
+                "Content-Type": "text/plain; version=0.0.4"
+            }
         
-        # Record request
-        self.request_count.labels(**cloud_labels).inc()
-        
-        # Record latency
-        latency = metrics_data.get("latency_ms", 100) / 1000
-        self.request_latency.labels(**cloud_labels).observe(latency)
-        
-        # Record CPU
-        cpu = metrics_data.get("cpu", 40)
-        self.cpu_usage.labels(**cloud_labels).set(cpu)
-        
-        # Record memory
-        memory = metrics_data.get("memory_percent", 50)
-        self.memory_usage.labels(**cloud_labels).set(memory)
-        
-        # Record error rate
-        error_rate = metrics_data.get("error_rate", 0.5)
-        self.error_rate.labels(**cloud_labels).set(error_rate)
+        @self.app.route("/health")
+        def health():
+            return {"status": "healthy", "service": self.service_name}
 
     @abstractmethod
-    def generate_metrics(self) -> Dict[str, Any]:
-        """Generate cloud-specific metrics. Override in subclass."""
+    def generate_metrics(self, active_requests: int) -> Dict[str, Any]:
+        """Generate cloud-specific metrics based on current active requests. Override in subclass."""
+        pass
+    
+    @abstractmethod
+    def compute_resource_usage(self, active_connections: int, rps: float) -> tuple:
+        """Compute CPU and memory usage based on load. Returns (cpu_percent, memory_percent)."""
         pass
 
     def run(self, debug: bool = False):
-        """Run Flask app."""
         logger.info(f"Starting {self.cloud_name.upper()} simulator for {self.service_name}")
         logger.info(f"Service running on http://0.0.0.0:{self.service_port}")
-        logger.info(f"Metrics available at http://0.0.0.0:{self.service_port}/metrics")
+        logger.info(f"Traffic-driven metrics enabled")
         
-        # Simulation thread
-        def simulate_continuously():
-            while True:
-                self.simulate_request()
-                time.sleep(2)  # Generate metrics every 2 seconds
-        
-        import threading
-        sim_thread = threading.Thread(target=simulate_continuously, daemon=True)
-        sim_thread.start()
-        
-        # Run Flask
-        self.app.run(host="0.0.0.0", port=self.service_port, debug=debug, use_reloader=False)
+        # We must run threaded=True to handle concurrent requests
+        self.app.run(host="0.0.0.0", port=self.service_port, debug=debug, use_reloader=False, threaded=True)

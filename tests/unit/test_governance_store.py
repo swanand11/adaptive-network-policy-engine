@@ -8,7 +8,7 @@ Tests cover:
 """
 
 import pytest
-from agents.governance_agent.state_store import InMemoryStore, GovernanceStateStore
+from agents.governance_agent.state_store import InMemoryStore, GovernanceStateStore, MongoStore
 
 
 class TestInMemoryStore:
@@ -73,6 +73,51 @@ class TestGovernanceStateStoreFactory:
 
         retrieved = store.get_previous_weights()
         assert retrieved == weights
+
+
+class _FakeCollection:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def find_one(self, query=None, sort=None):
+        query = query or {}
+        if query.get("type") == "weights":
+            for doc in self.docs:
+                if doc.get("type") == "weights":
+                    return doc
+            return None
+        if query.get("weights", {}).get("$exists"):
+            for doc in self.docs:
+                if "weights" in doc:
+                    return doc
+            return None
+        return None
+
+    def insert_one(self, doc):
+        class _Result:
+            inserted_id = "fake-id"
+        self.docs.insert(0, doc)
+        return _Result()
+
+
+class TestMongoStoreCompatibility:
+    def test_get_previous_weights_supports_typed_doc(self):
+        store = MongoStore.__new__(MongoStore)
+        store.collection = _FakeCollection(
+            [{"type": "weights", "weights": {"aws": 0.4, "aks": 0.3, "do": 0.3}}]
+        )
+        store.fallback_store = InMemoryStore()
+
+        assert store.get_previous_weights() == {"aws": 0.4, "aks": 0.3, "do": 0.3}
+
+    def test_get_previous_weights_supports_legacy_doc_without_type(self):
+        store = MongoStore.__new__(MongoStore)
+        store.collection = _FakeCollection(
+            [{"decision_id": "legacy-1", "weights": {"aws": 0.5, "aks": 0.3, "do": 0.2}}]
+        )
+        store.fallback_store = InMemoryStore()
+
+        assert store.get_previous_weights() == {"aws": 0.5, "aks": 0.3, "do": 0.2}
 
     def test_factory_fallback_on_mongo_unavailable(self):
         """Factory attempts Mongo but falls back gracefully if pymongo missing or connection fails."""
